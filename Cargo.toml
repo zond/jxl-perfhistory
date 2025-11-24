@@ -1,7 +1,7 @@
 [package]
 name = "jxl-perfhistory"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "BSD-3-Clause"
 description = "Benchmark jxl_cli decoding performance across git revisions"
 repository = "https://github.com/zond/jxl-perfhistory"
@@ -10,11 +10,11 @@ repository = "https://github.com/zond/jxl-perfhistory"
 clap = { version = "4.5", features = ["derive"] }
 git2 = "0.19"
 color-eyre = "0.6"
-statrs = "0.18"
 tempfile = "3"
 rand = "0.9"
 memmap2 = "0.9"
 bytemuck = "1.14"
+thiserror = "2.0.17"
 
 [lints.clippy]
 missing_safety_doc = "deny"

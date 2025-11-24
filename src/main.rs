@@ -4,16 +4,18 @@
 // license that can be found in the LICENSE file.
 
 use clap::Parser;
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::eyre::{Result, eyre};
 use git2::{Oid, Repository};
 use memmap2::Mmap;
 use rand::Rng;
-use statrs::distribution::{ContinuousCDF, StudentsT};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
+use std::result;
 use tempfile::TempDir;
+use thiserror::Error;
 
 #[derive(Parser, Debug)]
 #[command(name = "jxl-perfhistory")]
@@ -46,16 +48,6 @@ struct Args {
     /// Directory to store measurement data for resumable benchmarks
     #[arg(short = 'd', long = "data-directory")]
     data_directory: Option<String>,
-}
-
-struct Revision {
-    oid: Oid,
-    summary: String,
-    binary_path: Option<String>,
-    measurement_file: MeasurementFile,
-    mean: Option<f64>,
-    rel_error: Option<f64>,
-    ordinal: usize,
 }
 
 macro_rules! print_flush {
@@ -126,33 +118,129 @@ impl MeasurementFile {
     }
 }
 
-impl Revision {
-    /// Compute credible interval for a constant value measured with noise
-    ///
-    /// With uninformative priors, the Bayesian credible interval equals the
-    /// frequentist t-interval. Each measurement = true_value + noise, with
-    /// unknown true value and noise variance.
-    pub fn compute(&mut self, confidence: f64) -> Result<()> {
+struct MedianIndices {
+    target_confidence: f64,
+    mapping: HashMap<usize, (usize, usize, f64)>,
+}
+
+impl MedianIndices {
+    fn new(confidence: f64) -> Result<MedianIndices> {
         if !(0f64..=1f64).contains(&confidence) {
             return Err(eyre!("Can't compute with confidence {}", confidence));
         }
-        let measurements = &self.measurement_file.measurements;
-        let n = measurements.len() as f64;
-        if n <= 2f64 {
-            return Err(eyre!("Can't compute with {} measurements", n));
+        Ok(MedianIndices {
+            target_confidence: confidence,
+            mapping: HashMap::new(),
+        })
+    }
+    /// Compute the (lo, hi) indices for a median confidence interval using exact binomial probabilities.
+    ///
+    /// Uses Pascal's triangle to compute binomial coefficients exactly,
+    /// then finds the smallest symmetric interval around n/2 that achieves the target confidence.
+    ///
+    /// Returns (lo, hi, actual_confidence) where the CI is [sorted[lo], sorted[hi]].
+    fn get(&mut self, n: usize) -> (usize, usize, f64) {
+        if let Some(result) = self.mapping.get(&n) {
+            return *result;
         }
-        let mean = measurements.iter().sum::<f64>() / n;
+        // Build row n of Pascal's triangle: coeffs[k] = C(n, k)
+        // Using the recurrence: C(n, k) = C(n, k-1) * (n - k + 1) / k
+        let mut coeffs = vec![0u128; n + 1];
+        coeffs[0] = 1;
+        for k in 1..=n {
+            coeffs[k] = coeffs[k - 1] * (n - k + 1) as u128 / k as u128;
+        }
 
-        let variance = measurements.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
-        let std_error = (variance / n).sqrt();
+        // Total is 2^n (sum of all binomial coefficients)
+        let total: u128 = coeffs.iter().sum();
 
-        let t_dist = StudentsT::new(0.0, 1.0, n - 1.0).unwrap();
-        let t_critical = t_dist.inverse_cdf(1.0 - (1.0 - confidence) / 2.0);
-        let margin = t_critical * std_error;
+        // Compute cumulative sums: cdf[k] = sum of coeffs[0..=k] = C(n,0) + ... + C(n,k)
+        let mut cdf = vec![0u128; n + 1];
+        cdf[0] = coeffs[0];
+        for k in 1..=n {
+            cdf[k] = cdf[k - 1] + coeffs[k];
+        }
 
-        self.mean = Some(mean);
-        self.rel_error = Some(margin / mean.abs());
+        // Find smallest symmetric interval [lo, hi] around n/2 with confidence >= target
+        // Confidence of [lo, hi] = P(lo < W <= hi) = (cdf[hi] - cdf[lo]) / total
+        let center = n / 2;
+        let mut lo = center;
+        let mut hi = center;
+
+        loop {
+            // P(lo < W <= hi) = (cdf[hi] - cdf[lo]) / total
+            let confidence = (cdf[hi] - cdf[lo]) as f64 / total as f64;
+
+            if confidence >= self.target_confidence || (lo == 0 && hi == n - 1) {
+                self.mapping.insert(n, (lo, hi, confidence));
+                return (lo, hi, confidence);
+            }
+
+            // Expand symmetrically
+            lo = lo.saturating_sub(1);
+            if hi < n - 1 {
+                hi += 1;
+            }
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+#[error("Need at least 3 measurements, got {0}")]
+struct InsufficientSamples(usize);
+
+struct Revision {
+    oid: Oid,
+    summary: String,
+    binary_path: Option<String>,
+    measurement_file: MeasurementFile,
+    median: Option<f64>,
+    rel_error: Option<f64>,
+    ordinal: usize,
+}
+
+impl Revision {
+    /// Compute credible interval for median using order statistics.
+    ///
+    /// Uses the Bayesian interpretation: with an uninformative prior,
+    /// the probability that the true median lies between X_(r) and X_(s)
+    /// is given by the Binomial(n, 0.5) distribution. This is both a valid
+    /// Bayesian credible interval and a frequentist confidence interval.
+    pub fn compute_median(
+        &mut self,
+        mi: &mut MedianIndices,
+    ) -> result::Result<(), InsufficientSamples> {
+        let measurements = &self.measurement_file.measurements;
+        let n = measurements.len();
+        if n < 3 {
+            return Err(InsufficientSamples(n));
+        }
+
+        // Sort measurements to get order statistics
+        let mut sorted = measurements.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        // Compute median
+        let median = if n.is_multiple_of(2) {
+            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+        } else {
+            sorted[n / 2]
+        };
+
+        // Get CI indices using exact binomial probabilities
+        let (lo, hi, _actual_confidence) = mi.get(n);
+
+        let ci_lower = sorted[lo];
+        let ci_upper = sorted[hi];
+        let half_width = (ci_upper - ci_lower) / 2.0;
+
+        self.median = Some(median);
+        self.rel_error = Some(half_width / median.abs());
         Ok(())
+    }
+
+    pub fn n_measurements(&self) -> usize {
+        self.measurement_file.measurements.len()
     }
 
     pub fn benchmark(&mut self, jxl_file: &str) -> Result<()> {
@@ -250,7 +338,7 @@ fn collect_revisions(
                     .to_string(),
                 binary_path: None,
                 measurement_file,
-                mean: None,
+                median: None,
                 rel_error: None,
                 ordinal,
             })
@@ -316,13 +404,32 @@ fn main() -> Result<()> {
 
     let repo = Repository::open(".")?;
     let original_ref_name = verify_repo(&repo)?;
+    let mut mi = MedianIndices::new(args.confidence)?;
 
     let result: Result<()> = (|| {
-        let mut unfinished_revisions = collect_revisions(
+        let mut unfinished_revisions = vec![];
+        let mut finished_revisions = vec![];
+        for mut rev in collect_revisions(
             &repo,
             args.revisions,
             args.data_directory.as_deref().map(Path::new),
-        )?;
+        )? {
+            if let Err(InsufficientSamples(_)) = rev.compute_median(&mut mi) {
+                unfinished_revisions.push(rev);
+            } else if let Some(current_error) = rev.rel_error
+                && current_error <= args.rel_error
+            {
+                println!(
+                    "{:.8}: {:<50} is already done",
+                    rev.oid,
+                    rev.clipped_summary(50)
+                );
+                finished_revisions.push(rev);
+            } else {
+                unfinished_revisions.push(rev);
+            }
+        }
+
         for rev in &mut unfinished_revisions {
             checkout_revision(&repo, rev.oid)?;
             print_flush!("Building {}: {}...", rev.oid, rev.summary);
@@ -330,7 +437,7 @@ fn main() -> Result<()> {
             println!("done!");
         }
         restore_repo(&repo, original_ref_name)?;
-        let mut finished_revisions = vec![];
+
         while !unfinished_revisions.is_empty() {
             let idx = rng.random_range(0..unfinished_revisions.len());
             let done_with_revision = {
@@ -341,31 +448,27 @@ fn main() -> Result<()> {
                     rev.clipped_summary(50)
                 );
                 rev.benchmark(&args.jxl_file)?;
-                let n = rev.measurement_file.measurements.len();
-                if n > 2 {
-                    let old_relative_error = rev.rel_error;
-                    rev.compute(args.confidence)?;
-                    if n >= args.min_measurements && rev.rel_error.unwrap() <= args.rel_error {
-                        println!(
-                            "done! {} samples, mean/error ({:.2}/{:.4} (from {:?})) is *GOOD ENOUGH*",
-                            n,
-                            rev.mean.unwrap(),
-                            rev.rel_error.unwrap(),
-                            old_relative_error,
-                        );
-                        true
-                    } else {
-                        println!(
-                            "done! {} samples, mean/error: {:.2}/{:.4} (from {:?})",
-                            n,
-                            rev.mean.unwrap(),
-                            rev.rel_error.unwrap(),
-                            old_relative_error,
-                        );
-                        false
-                    }
-                } else {
+                let old_relative_error = rev.rel_error;
+                if let Err(InsufficientSamples(_)) = rev.compute_median(&mut mi) {
                     println!("done!");
+                    false
+                } else if rev.rel_error.unwrap() <= args.rel_error {
+                    println!(
+                        "done! {} samples, median/error ({:.2}/{:.4} (from {:?})) is *GOOD ENOUGH*",
+                        rev.n_measurements(),
+                        rev.median.unwrap(),
+                        rev.rel_error.unwrap(),
+                        old_relative_error,
+                    );
+                    true
+                } else {
+                    println!(
+                        "done! {} samples, median/error: {:.2}/{:.4} (from {:?})",
+                        rev.n_measurements(),
+                        rev.median.unwrap(),
+                        rev.rel_error.unwrap(),
+                        old_relative_error,
+                    );
                     false
                 }
             };
@@ -393,7 +496,7 @@ fn print_results(results: &[Revision], args: &Args) {
     let mut max = f64::MIN;
     let mut sum = 0f64;
     for rev in results.iter() {
-        let m = rev.mean.unwrap();
+        let m = rev.median.unwrap();
         min = min.min(m);
         max = max.max(m);
         sum += m;
@@ -418,7 +521,7 @@ fn print_results(results: &[Revision], args: &Args) {
     println!("{}", "-".repeat(80));
 
     for (i, result) in results.iter().enumerate() {
-        let speed = result.mean.unwrap();
+        let speed = result.median.unwrap();
         let normalized = ((speed - min) / (max - min) * 40.0) as usize;
         let bar = "\u{2588}".repeat(normalized.max(1));
 
@@ -458,7 +561,7 @@ fn print_results(results: &[Revision], args: &Args) {
             i + 1,
             result.oid,
             result.clipped_summary(50),
-            result.mean.unwrap()
+            result.median.unwrap()
         );
     }
 }
