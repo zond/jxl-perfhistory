@@ -518,7 +518,7 @@ fn print_results(results: &[Revision], args: &Args) {
     // Show performance graph with credible intervals
     println!("\n{}", "=".repeat(80));
     println!("Performance Graph (with credible intervals):");
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(150));
 
     // Find the full range including all CI bounds
     let mut graph_min = min;
@@ -531,7 +531,7 @@ fn print_results(results: &[Revision], args: &Args) {
     }
     let graph_range = graph_max - graph_min;
 
-    const BAR_WIDTH: usize = 40;
+    const BAR_WIDTH: usize = 60;
 
     for (i, result) in results.iter().enumerate() {
         let median = result.median.unwrap();
@@ -566,15 +566,16 @@ fn print_results(results: &[Revision], args: &Args) {
         };
 
         println!(
-            "[{:2}] {:.8} {:40} {:.2} {}",
+            "[{:2}] {:.8} {:<50} | {:60} | {:.2} {}",
             i + 1,
             result.oid,
+            result.clipped_summary(50),
             bar_str,
             median,
             marker
         );
     }
 
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(150));
     println!("Scale: {:.0} to {:.0} pixels/s", graph_min, graph_max);
 }
