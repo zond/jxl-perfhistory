@@ -515,53 +515,66 @@ fn print_results(results: &[Revision], args: &Args) {
         ((max - min) / min) * 100.0
     );
 
-    // Show performance graph
+    // Show performance graph with credible intervals
     println!("\n{}", "=".repeat(80));
-    println!("Performance Graph (normalized to max):");
+    println!("Performance Graph (with credible intervals):");
     println!("{}", "-".repeat(80));
 
-    for (i, result) in results.iter().enumerate() {
-        let speed = result.median.unwrap();
-        let normalized = ((speed - min) / (max - min) * 40.0) as usize;
-        let bar = "\u{2588}".repeat(normalized.max(1));
+    // Find the full range including all CI bounds
+    let mut graph_min = min;
+    let mut graph_max = max;
+    for result in results.iter() {
+        let median = result.median.unwrap();
+        let half_width = result.rel_error.unwrap() * median;
+        graph_min = graph_min.min(median - half_width);
+        graph_max = graph_max.max(median + half_width);
+    }
+    let graph_range = graph_max - graph_min;
 
-        let marker = if speed == max {
-            "\u{25b2} MAX"
-        } else if speed == min {
-            "\u{25bc} MIN"
+    const BAR_WIDTH: usize = 40;
+
+    for (i, result) in results.iter().enumerate() {
+        let median = result.median.unwrap();
+        let half_width = result.rel_error.unwrap() * median;
+        let ci_lower = median - half_width;
+        let ci_upper = median + half_width;
+
+        // Normalize positions to bar width
+        let pos_lower = ((ci_lower - graph_min) / graph_range * (BAR_WIDTH - 1) as f64) as usize;
+        let pos_median = ((median - graph_min) / graph_range * (BAR_WIDTH - 1) as f64) as usize;
+        let pos_upper = ((ci_upper - graph_min) / graph_range * (BAR_WIDTH - 1) as f64) as usize;
+
+        // Build the bar string
+        let mut bar = vec![' '; BAR_WIDTH];
+        bar[pos_lower] = '├';
+        for j in (pos_lower + 1)..pos_median {
+            bar[j] = '─';
+        }
+        bar[pos_median] = '│';
+        for j in (pos_median + 1)..pos_upper {
+            bar[j] = '─';
+        }
+        bar[pos_upper] = '┤';
+        let bar_str: String = bar.into_iter().collect();
+
+        let marker = if median == max {
+            "▲ MAX"
+        } else if median == min {
+            "▼ MIN"
         } else {
             ""
         };
 
         println!(
-            "[{:2}] {:.8} {:<50} {:40} {:.2} {}",
+            "[{:2}] {:.8} {:40} {:.2} {}",
             i + 1,
             result.oid,
-            result.clipped_summary(50),
-            bar,
-            speed,
+            bar_str,
+            median,
             marker
         );
     }
 
     println!("{}", "-".repeat(80));
-    println!("Scale: Min={:.0} pixels/s, Max={:.0} pixels/s", min, max);
-
-    println!("\nDetailed Results:");
-    println!("{}", "-".repeat(80));
-    println!(
-        "{:<4} {:<10} {:<50} {:>20}",
-        "#", "Commit", "Message", "Performance"
-    );
-    println!("{}", "-".repeat(80));
-
-    for (i, result) in results.iter().enumerate() {
-        println!(
-            "[{:2}] {:.8} {:<50} {:>20.2} pixels/s",
-            i + 1,
-            result.oid,
-            result.clipped_summary(50),
-            result.median.unwrap()
-        );
-    }
+    println!("Scale: {:.0} to {:.0} pixels/s", graph_min, graph_max);
 }
