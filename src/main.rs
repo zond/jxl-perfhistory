@@ -414,15 +414,20 @@ fn main() -> Result<()> {
             args.revisions,
             args.data_directory.as_deref().map(Path::new),
         )? {
-            if let Err(InsufficientSamples(_)) = rev.compute_median(&mut mi) {
+            if rev.n_measurements() < args.min_measurements {
+                unfinished_revisions.push(rev);
+            } else if let Err(InsufficientSamples(_)) = rev.compute_median(&mut mi) {
                 unfinished_revisions.push(rev);
             } else if let Some(current_error) = rev.rel_error
                 && current_error <= args.rel_error
             {
                 println!(
-                    "{:.8}: {:<50} is already done",
+                    "{:.8}: {:<50} is already done, {} samples, median/error: {:.2}/{:.4}",
                     rev.oid,
-                    rev.clipped_summary(50)
+                    rev.clipped_summary(50),
+                    rev.n_measurements(),
+                    rev.median.unwrap(),
+                    rev.rel_error.unwrap()
                 );
                 finished_revisions.push(rev);
             } else {
@@ -449,10 +454,13 @@ fn main() -> Result<()> {
                 );
                 rev.benchmark(&args.jxl_file)?;
                 let old_relative_error = rev.rel_error;
+
                 if let Err(InsufficientSamples(_)) = rev.compute_median(&mut mi) {
                     println!("done!");
                     false
-                } else if rev.rel_error.unwrap() <= args.rel_error {
+                } else if rev.n_measurements() >= args.min_measurements
+                    && rev.rel_error.unwrap() <= args.rel_error
+                {
                     println!(
                         "done! {} samples, median/error ({:.2}/{:.4} (from {:?})) is *GOOD ENOUGH*",
                         rev.n_measurements(),
@@ -547,12 +555,12 @@ fn print_results(results: &[Revision], args: &Args) {
         // Build the bar string
         let mut bar = vec![' '; BAR_WIDTH];
         bar[pos_lower] = '├';
-        for j in (pos_lower + 1)..pos_median {
-            bar[j] = '─';
+        for char in bar[(pos_lower + 1)..pos_median].iter_mut() {
+            *char = '─';
         }
         bar[pos_median] = '│';
-        for j in (pos_median + 1)..pos_upper {
-            bar[j] = '─';
+        for char in bar[(pos_median + 1)..pos_upper].iter_mut() {
+            *char = '─';
         }
         bar[pos_upper] = '┤';
         let bar_str: String = bar.into_iter().collect();
