@@ -566,11 +566,11 @@ fn print_results(results: &[Revision], args: &Args) {
         let bar_str: String = bar.into_iter().collect();
 
         let marker = if median == max {
-            "▲ MAX"
+            format!("▲ MAX ({:.2} / min)", max / min)
         } else if median == min {
-            "▼ MIN"
+            format!("▼ MIN ({:.2} / max)", min / max)
         } else {
-            ""
+            "".to_string()
         };
 
         println!(
