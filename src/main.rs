@@ -293,7 +293,11 @@ impl Revision {
             ));
         }
 
-        fs::copy(Path::new("target/release/jxl_cli"), &binary_path)?;
+        let binary_name = format!("jxl_cli{}", std::env::consts::EXE_SUFFIX);   
+        let source_path = Path::new("target")
+            .join("release")
+            .join(&binary_name);
+        fs::copy(&source_path, &binary_path)?;
 
         Ok(())
     }
