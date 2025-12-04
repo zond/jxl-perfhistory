@@ -42,6 +42,9 @@ jxl-perfhistory -f /path/to/image.jxl
 | `-e, --error <F>` | Maximum relative error threshold | 0.05 |
 | `-m, --min-measurements <N>` | Minimum measurements per revision | 10 |
 | `-b, --binary-directory <PATH>` | Persistent directory for built binaries | temp |
+| `-d, --data-directory <DATA_DIRECTORY>` | Directory to store measurement data for resumable benchmarks | temp |
+
+*Note: `-b` and `-d` cannot be the same directory.*
 
 ### Examples
 
@@ -65,6 +68,7 @@ jxl-perfhistory -f test.jxl -c 0.99 -e 0.02
 - Must be run from within a clean jxl-rs git repository (no uncommitted changes)
 - The repository must be on a branch (not in detached HEAD state)
 - Rust toolchain for building jxl_cli
+	- For Windows, the MSVC toolchain must be used
 
 ## Output
 
