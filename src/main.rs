@@ -1351,7 +1351,8 @@ fn format_file_with_preview(file_name: &str) -> String {
     let preview_url = format!("https://raw.githubusercontent.com/libjxl/conformance/master/testcases/{}/ref.png", base_name);
 
     // Format: image preview + linked filename
-    format!("<img src=\"{}\" width=\"20\" /> [{}]({})", preview_url, file_name, conformance_url)
+    // Using HTML img tag with proper attribute syntax
+    format!("<img src='{}' width='20'> [{}]({})", preview_url, file_name, conformance_url)
 }
 
 // ============================================================================
