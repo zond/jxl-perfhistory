@@ -20,38 +20,31 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 use thiserror::Error;
 
-/// Global cleanup state for Ctrl-C handler
-static CLEANUP_STATE: Mutex<CleanupState> = Mutex::new(CleanupState {
-    paused_processes: Vec::new(),
-    original_branch: None,
-});
+/// Global registry of cleanup functions for Ctrl-C handler
+type CleanupFn = Box<dyn FnMut() + Send>;
+static CLEANUP_REGISTRY: Mutex<Vec<Option<CleanupFn>>> = Mutex::new(Vec::new());
 
-struct CleanupState {
-    paused_processes: Vec<String>,
-    original_branch: Option<String>,
+fn register_cleanup(f: CleanupFn) -> usize {
+    let mut registry = CLEANUP_REGISTRY.lock().unwrap();
+    let id = registry.len();
+    registry.push(Some(f));
+    id
+}
+
+fn unregister_cleanup(id: usize) {
+    let mut registry = CLEANUP_REGISTRY.lock().unwrap();
+    if id < registry.len() {
+        registry[id] = None;
+    }
 }
 
 fn setup_ctrlc_handler() {
     ctrlc::set_handler(move || {
         eprintln!("\nInterrupted, cleaning up...");
-        let state = CLEANUP_STATE.lock().unwrap();
-
-        // Resume paused processes
-        for name in &state.paused_processes {
-            let _ = Command::new("killall").args(["-SIGCONT", name]).output();
+        let mut registry = CLEANUP_REGISTRY.lock().unwrap();
+        for cleanup_fn in registry.iter_mut().flatten() {
+            cleanup_fn();
         }
-        if !state.paused_processes.is_empty() {
-            eprintln!("Resumed processes: {}", state.paused_processes.join(", "));
-        }
-
-        // Restore original branch
-        if let Some(ref branch) = state.original_branch
-            && let Ok(repo) = Repository::open(".")
-        {
-            let _ = restore_repo(&repo, branch.clone());
-            eprintln!("Restored branch: {}", branch);
-        }
-
         std::process::exit(130); // Standard exit code for Ctrl-C
     })
     .expect("Error setting Ctrl-C handler");
@@ -210,9 +203,29 @@ impl NoiseMetrics {
     }
 }
 
+/// Unpause processes by sending SIGCONT
+fn unpause_processes(processes: &[String]) {
+    if processes.is_empty() {
+        return;
+    }
+    println!("Resuming processes: {}", processes.join(", "));
+    for name in processes {
+        let output = Command::new("killall").args(["-SIGCONT", name]).output();
+        if let Ok(output) = output
+            && !output.status.success()
+        {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("no process found") {
+                eprintln!("Warning: failed to resume {}: {}", name, stderr.trim());
+            }
+        }
+    }
+}
+
 /// RAII guard to ensure processes are resumed even on panic/error
 struct ProcessPauser {
     processes: Vec<String>,
+    cleanup_id: Option<usize>,
 }
 
 impl ProcessPauser {
@@ -222,34 +235,36 @@ impl ProcessPauser {
             for name in &processes {
                 let output = Command::new("killall").args(["-SIGSTOP", name]).output()?;
                 if !output.status.success() {
-                    // Not an error if process doesn't exist
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     if !stderr.contains("no process found") {
                         eprintln!("Warning: failed to pause {}: {}", name, stderr.trim());
                     }
                 }
             }
-            // Register with global state for Ctrl-C handler
-            CLEANUP_STATE.lock().unwrap().paused_processes = processes.clone();
         }
-        Ok(Self { processes })
+
+        // Register cleanup closure
+        let cleanup_id = if !processes.is_empty() {
+            let procs = processes.clone();
+            Some(register_cleanup(Box::new(move || {
+                unpause_processes(&procs);
+            })))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            processes,
+            cleanup_id,
+        })
     }
 
     fn resume(&mut self) -> Result<()> {
-        if !self.processes.is_empty() {
-            println!("Resuming processes: {}", self.processes.join(", "));
-            for name in &self.processes {
-                let output = Command::new("killall").args(["-SIGCONT", name]).output()?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !stderr.contains("no process found") {
-                        eprintln!("Warning: failed to resume {}: {}", name, stderr.trim());
-                    }
-                }
-            }
-            self.processes.clear();
-            // Unregister from global state
-            CLEANUP_STATE.lock().unwrap().paused_processes.clear();
+        unpause_processes(&self.processes);
+        self.processes.clear();
+        // Unregister from cleanup registry
+        if let Some(id) = self.cleanup_id.take() {
+            unregister_cleanup(id);
         }
         Ok(())
     }
@@ -257,14 +272,12 @@ impl ProcessPauser {
 
 impl Drop for ProcessPauser {
     fn drop(&mut self) {
-        // Safety net: try to resume if not already done
         if !self.processes.is_empty() {
             eprintln!("Warning: ProcessPauser dropped without explicit resume, resuming now...");
-            for name in &self.processes {
-                let _ = Command::new("killall").args(["-SIGCONT", name]).output();
-            }
-            // Unregister from global state
-            CLEANUP_STATE.lock().unwrap().paused_processes.clear();
+            unpause_processes(&self.processes);
+        }
+        if let Some(id) = self.cleanup_id.take() {
+            unregister_cleanup(id);
         }
     }
 }
@@ -272,14 +285,22 @@ impl Drop for ProcessPauser {
 /// RAII guard to ensure git repo is restored to original branch even on panic/error
 struct RepoGuard {
     original_ref_name: Option<String>,
+    cleanup_id: Option<usize>,
 }
 
 impl RepoGuard {
     fn new(original_ref_name: String) -> Self {
-        // Register with global state for Ctrl-C handler
-        CLEANUP_STATE.lock().unwrap().original_branch = Some(original_ref_name.clone());
+        // Register cleanup closure for Ctrl-C handler
+        let ref_name = original_ref_name.clone();
+        let cleanup_id = Some(register_cleanup(Box::new(move || {
+            eprintln!("Restoring repo to: {}", ref_name);
+            if let Ok(repo) = Repository::open(".") {
+                let _ = restore_repo(&repo, ref_name.clone());
+            }
+        })));
         Self {
             original_ref_name: Some(original_ref_name),
+            cleanup_id,
         }
     }
 
@@ -289,8 +310,10 @@ impl RepoGuard {
             let repo = Repository::open(".")?;
             restore_repo(&repo, original_ref_name.clone())?;
             self.original_ref_name = None;
-            // Unregister from global state
-            CLEANUP_STATE.lock().unwrap().original_branch = None;
+        }
+        // Unregister from cleanup registry
+        if let Some(id) = self.cleanup_id.take() {
+            unregister_cleanup(id);
         }
         Ok(())
     }
@@ -304,8 +327,10 @@ impl Drop for RepoGuard {
             if let Ok(repo) = Repository::open(".") {
                 let _ = restore_repo(&repo, original_ref_name.clone());
             }
-            // Unregister from global state
-            CLEANUP_STATE.lock().unwrap().original_branch = None;
+        }
+        // Unregister from cleanup registry
+        if let Some(id) = self.cleanup_id.take() {
+            unregister_cleanup(id);
         }
     }
 }
@@ -697,7 +722,7 @@ fn verify_repo(repo: &Repository) -> Result<String> {
         ));
     }
 
-    // Save original HEAD state (branch or detached)
+    // Save original HEAD state (branch or detached commit)
     let head = repo.head()?;
     if head.is_branch() {
         head.name()
@@ -706,14 +731,24 @@ fn verify_repo(repo: &Repository) -> Result<String> {
             ))
             .map(|s| s.into())
     } else {
-        Err(eyre!(
-            "Working directory isn't a checked out branch, won't be able to restore it properly."
-        ))
+        // Detached HEAD - save the commit hash
+        let oid = head.target().ok_or(eyre!(
+            "Detached HEAD doesn't point to a commit, won't be able to restore it properly."
+        ))?;
+        Ok(oid.to_string())
     }
 }
 
-fn restore_repo(repo: &Repository, original_ref_name: String) -> Result<()> {
-    repo.set_head(&original_ref_name)?;
+fn restore_repo(repo: &Repository, original_ref: String) -> Result<()> {
+    // Check if it's a commit hash (40 hex chars) or a branch ref
+    if original_ref.len() == 40 && original_ref.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Detached HEAD - restore to specific commit
+        let oid = Oid::from_str(&original_ref)?;
+        repo.set_head_detached(oid)?;
+    } else {
+        // Branch ref
+        repo.set_head(&original_ref)?;
+    }
     let mut opts = git2::build::CheckoutBuilder::new();
     opts.force();
     repo.checkout_head(Some(&mut opts))?;
