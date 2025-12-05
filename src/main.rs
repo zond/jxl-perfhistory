@@ -150,15 +150,15 @@ impl NoiseMetrics {
         }
 
         let mut warnings = vec![];
-        if let Some(load) = self.load_average {
-            if load > 1.0 {
-                warnings.push(format!("high system load ({:.2})", load));
-            }
+        if let Some(load) = self.load_average
+            && load > 1.0
+        {
+            warnings.push(format!("high system load ({:.2})", load));
         }
-        if let Some(cv) = self.calibration_cv {
-            if cv > 0.05 {
-                warnings.push(format!("high calibration variance (CV={:.1}%)", cv * 100.0));
-            }
+        if let Some(cv) = self.calibration_cv
+            && cv > 0.05
+        {
+            warnings.push(format!("high calibration variance (CV={:.1}%)", cv * 100.0));
         }
 
         if warnings.is_empty() {
@@ -182,9 +182,7 @@ impl ProcessPauser {
         if !processes.is_empty() {
             println!("Pausing processes: {}", processes.join(", "));
             for name in &processes {
-                let output = Command::new("killall")
-                    .args(["-SIGSTOP", name])
-                    .output()?;
+                let output = Command::new("killall").args(["-SIGSTOP", name]).output()?;
                 if !output.status.success() {
                     // Not an error if process doesn't exist
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -201,9 +199,7 @@ impl ProcessPauser {
         if !self.processes.is_empty() {
             println!("Resuming processes: {}", self.processes.join(", "));
             for name in &self.processes {
-                let output = Command::new("killall")
-                    .args(["-SIGCONT", name])
-                    .output()?;
+                let output = Command::new("killall").args(["-SIGCONT", name]).output()?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     if !stderr.contains("no process found") {
@@ -223,9 +219,7 @@ impl Drop for ProcessPauser {
         if !self.processes.is_empty() {
             eprintln!("Warning: ProcessPauser dropped without explicit resume, resuming now...");
             for name in &self.processes {
-                let _ = Command::new("killall")
-                    .args(["-SIGCONT", name])
-                    .output();
+                let _ = Command::new("killall").args(["-SIGCONT", name]).output();
             }
         }
     }
@@ -412,6 +406,8 @@ struct FileResult {
     measurement_file: MeasurementFile,
     median: Option<f64>,
     rel_error: Option<f64>,
+    /// Number of repetitions to use for benchmarking (calibrated on first run)
+    num_reps: Option<u32>,
 }
 
 impl FileResult {
@@ -421,6 +417,7 @@ impl FileResult {
             measurement_file,
             median: None,
             rel_error: None,
+            num_reps: None,
         }
     }
 
@@ -471,13 +468,14 @@ struct Revision {
     ordinal: usize,
 }
 
+const TARGET_BENCHMARK_SECS: f64 = 0.5;
+
 impl Revision {
-    /// Benchmark a specific file and append the result to its measurements
-    pub fn benchmark(&mut self, file_idx: usize) -> Result<()> {
-        let file_result = &mut self.file_results[file_idx];
+    /// Run jxl_cli benchmark and return pixels/s
+    fn run_benchmark(&self, file_path: &str, num_reps: u32) -> Result<f64> {
         let output = Command::new(self.binary_path.as_ref().unwrap())
-            .arg(&file_result.file_path)
-            .args(["--speedtest", "--num-reps", "1"])
+            .arg(file_path)
+            .args(["--speedtest", "--num-reps", &num_reps.to_string()])
             .output()?;
         if !output.status.success() {
             return Err(eyre!(
@@ -487,14 +485,50 @@ impl Revision {
             ));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let pixels_per_sec: f64 = stdout
+        stdout
             .lines()
             .find(|line| line.contains("pixels/s") && line.contains("Decoded"))
             .and_then(|line| line.split_whitespace().rev().nth(1))
             .ok_or_else(|| eyre!("Can't find decoding speed in `{}`", stdout))?
             .parse()
-            .map_err(|e| eyre!("Can't parse decoding speed: {}", e))?;
-        file_result.measurement_file.append(pixels_per_sec)?;
+            .map_err(|e| eyre!("Can't parse decoding speed: {}", e))
+    }
+
+    /// Benchmark a specific file and append the result to its measurements.
+    /// On first run, calibrates num_reps to achieve TARGET_BENCHMARK_SECS.
+    pub fn benchmark(&mut self, file_idx: usize) -> Result<()> {
+        use std::time::Instant;
+
+        let file_path = self.file_results[file_idx].file_path.clone();
+        let num_reps = self.file_results[file_idx].num_reps;
+
+        // Calibrate num_reps on first measurement
+        if num_reps.is_none() {
+            let start = Instant::now();
+            let pixels_per_sec = self.run_benchmark(&file_path, 1)?;
+            let elapsed = start.elapsed().as_secs_f64();
+
+            if elapsed < TARGET_BENCHMARK_SECS {
+                let needed_reps = (TARGET_BENCHMARK_SECS / elapsed).ceil() as u32;
+                self.file_results[file_idx].num_reps = Some(needed_reps);
+                // Redo measurement with correct num_reps
+                let pixels_per_sec = self.run_benchmark(&file_path, needed_reps)?;
+                self.file_results[file_idx]
+                    .measurement_file
+                    .append(pixels_per_sec)?;
+            } else {
+                self.file_results[file_idx].num_reps = Some(1);
+                self.file_results[file_idx]
+                    .measurement_file
+                    .append(pixels_per_sec)?;
+            }
+        } else {
+            let pixels_per_sec = self.run_benchmark(&file_path, num_reps.unwrap())?;
+            self.file_results[file_idx]
+                .measurement_file
+                .append(pixels_per_sec)?;
+        }
+
         Ok(())
     }
 
@@ -704,11 +738,7 @@ fn main() -> Result<()> {
     print_flush!("Calibrating system noise...");
     let noise_metrics = NoiseMetrics::measure(10);
     if let (Some(load), Some(cv)) = (noise_metrics.load_average, noise_metrics.calibration_cv) {
-        println!(
-            "done (load: {:.2}, CV: {:.1}%)",
-            load,
-            cv * 100.0
-        );
+        println!("done (load: {:.2}, CV: {:.1}%)", load, cv * 100.0);
     } else if let Some(cv) = noise_metrics.calibration_cv {
         println!("done (CV: {:.1}%)", cv * 100.0);
     } else {
@@ -874,10 +904,10 @@ fn draw_ci_bar(
     let mut bar = vec![' '; bar_width];
 
     // Draw baseline marker first (if provided)
-    if let Some(bp) = baseline_pos {
-        if bp < bar_width {
-            bar[bp] = '┃';
-        }
+    if let Some(bp) = baseline_pos
+        && bp < bar_width
+    {
+        bar[bp] = '┃';
     }
 
     let lo = pos_lower.min(bar_width - 1);
@@ -1028,7 +1058,11 @@ fn compute_ratio_stats(
     Some((median, ci_lower, ci_upper))
 }
 
-fn print_results_multifile(results: &[Revision], mi: &mut MedianIndices, noise_metrics: &NoiseMetrics) {
+fn print_results_multifile(
+    results: &[Revision],
+    mi: &mut MedianIndices,
+    noise_metrics: &NoiseMetrics,
+) {
     print_header(
         &format!(
             "MULTI-FILE BENCHMARK RESULTS ({} files, {} revisions)",
