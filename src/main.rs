@@ -58,6 +58,10 @@ struct Args {
     /// Continue benchmarking even if system appears noisy
     #[arg(long = "ignore-noisy-system")]
     ignore_noisy_system: bool,
+
+    /// Comma-separated list of process names to pause during benchmarking (e.g., "chrome,firefox")
+    #[arg(long = "pause-processes", value_delimiter = ',')]
+    pause_processes: Vec<String>,
 }
 
 macro_rules! print_flush {
@@ -164,6 +168,100 @@ impl NoiseMetrics {
                 "WARNING: System appears noisy: {}. Results may be unreliable.",
                 warnings.join(", ")
             ))
+        }
+    }
+}
+
+/// RAII guard to ensure processes are resumed even on panic/error
+struct ProcessPauser {
+    processes: Vec<String>,
+}
+
+impl ProcessPauser {
+    fn new(processes: Vec<String>) -> Result<Self> {
+        if !processes.is_empty() {
+            println!("Pausing processes: {}", processes.join(", "));
+            for name in &processes {
+                let output = Command::new("killall")
+                    .args(["-SIGSTOP", name])
+                    .output()?;
+                if !output.status.success() {
+                    // Not an error if process doesn't exist
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.contains("no process found") {
+                        eprintln!("Warning: failed to pause {}: {}", name, stderr.trim());
+                    }
+                }
+            }
+        }
+        Ok(Self { processes })
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        if !self.processes.is_empty() {
+            println!("Resuming processes: {}", self.processes.join(", "));
+            for name in &self.processes {
+                let output = Command::new("killall")
+                    .args(["-SIGCONT", name])
+                    .output()?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.contains("no process found") {
+                        eprintln!("Warning: failed to resume {}: {}", name, stderr.trim());
+                    }
+                }
+            }
+            self.processes.clear(); // Disarm
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ProcessPauser {
+    fn drop(&mut self) {
+        // Safety net: try to resume if not already done
+        if !self.processes.is_empty() {
+            eprintln!("Warning: ProcessPauser dropped without explicit resume, resuming now...");
+            for name in &self.processes {
+                let _ = Command::new("killall")
+                    .args(["-SIGCONT", name])
+                    .output();
+            }
+        }
+    }
+}
+
+/// RAII guard to ensure git repo is restored to original branch even on panic/error
+struct RepoGuard {
+    original_ref_name: Option<String>,
+}
+
+impl RepoGuard {
+    fn new(original_ref_name: String) -> Self {
+        Self {
+            original_ref_name: Some(original_ref_name),
+        }
+    }
+
+    /// Explicitly restore the repo to the original branch
+    fn restore(&mut self) -> Result<()> {
+        if let Some(ref original_ref_name) = self.original_ref_name {
+            let repo = Repository::open(".")?;
+            restore_repo(&repo, original_ref_name.clone())?;
+            self.original_ref_name = None; // Disarm
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RepoGuard {
+    fn drop(&mut self) {
+        // Safety net: try to restore if not already done
+        if let Some(ref original_ref_name) = self.original_ref_name {
+            eprintln!("Warning: RepoGuard dropped without explicit restore, restoring now...");
+            if let Ok(repo) = Repository::open(".") {
+                let _ = restore_repo(&repo, original_ref_name.clone());
+            }
         }
     }
 }
@@ -664,6 +762,9 @@ fn main() -> Result<()> {
             .map(|(i, _)| i)
             .collect();
 
+        // RAII guard ensures repo is restored even on error/panic
+        let mut repo_guard = RepoGuard::new(original_ref_name.clone());
+
         for &rev_idx in &unfinished_rev_indices {
             let rev = &mut revisions[rev_idx];
             checkout_revision(&repo, rev.oid)?;
@@ -671,7 +772,12 @@ fn main() -> Result<()> {
             rev.build(binary_dir)?;
             println!("done!");
         }
-        restore_repo(&repo, original_ref_name.clone())?;
+
+        // Restore repo (explicit for error handling, guard is safety net)
+        repo_guard.restore()?;
+
+        // RAII guard ensures processes are resumed even on error/panic
+        let mut process_pauser = ProcessPauser::new(args.pause_processes.clone())?;
 
         // Benchmark loop: randomly sample unfinished (revision, file) pairs
         loop {
@@ -727,6 +833,9 @@ fn main() -> Result<()> {
                 fr.close();
             }
         }
+
+        // Resume paused processes (explicit for error handling, guard is safety net)
+        process_pauser.resume()?;
 
         // Sort by ordinal for display
         revisions.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
