@@ -1368,13 +1368,20 @@ fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metric
 
     // Header
     println!("# 🚀 JPEG XL Performance Benchmark\n");
-    println!("> **File**: `{}`", file_name);
-    if let Some(ref url) = github_url {
-        println!("> **Repository**: {}", url);
+
+    // Benchmark info table
+    let file_display = format_file_with_preview(file_name);
+    let repo_url = if let Some(ref url) = github_url {
+        url.clone()
     } else {
-        println!("> **Repository**: https://github.com/zond/jxl-perfhistory");
-    }
-    println!("> **CPU Architecture**: {}\n", std::env::consts::ARCH);
+        "https://github.com/zond/jxl-perfhistory".to_string()
+    };
+
+    println!("| | |");
+    println!("|---|---|");
+    println!("| **File** | {} |", file_display);
+    println!("| **Repository** | {} |", repo_url);
+    println!("| **CPU Architecture** | {} |\n", std::env::consts::ARCH);
     println!("---\n");
 
     // Calculate statistics
