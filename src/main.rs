@@ -963,7 +963,7 @@ fn print_header(title: &str, noise_metrics: &NoiseMetrics, width: usize) {
     println!("{}", "=".repeat(width));
 }
 
-/// Draw a CI bar: ├───│───┤
+/// Draw a CI bar: [---|---]
 /// Returns the bar as a string
 fn draw_ci_bar(
     pos_lower: usize,
@@ -978,29 +978,29 @@ fn draw_ci_bar(
     if let Some(bp) = baseline_pos
         && bp < bar_width
     {
-        bar[bp] = '┃';
+        bar[bp] = '!';
     }
 
     let lo = pos_lower.min(bar_width - 1);
     let hi = pos_upper.min(bar_width - 1);
     let med = pos_median.min(bar_width - 1);
 
-    bar[lo] = '├';
-    bar[hi] = '┤';
+    bar[lo] = '[';
+    bar[hi] = ']';
 
     for c in bar.iter_mut().take(med).skip(lo + 1) {
-        if *c == '┃' {
-            *c = '╂'; // CI crosses baseline
+        if *c == '!' {
+            *c = '+'; // CI crosses baseline
         } else {
-            *c = '─';
+            *c = '-';
         }
     }
-    bar[med] = '│';
+    bar[med] = '|';
     for c in bar.iter_mut().take(hi).skip(med + 1) {
-        if *c == '┃' {
-            *c = '╂';
+        if *c == '!' {
+            *c = '+';
         } else {
-            *c = '─';
+            *c = '-';
         }
     }
 
@@ -1254,7 +1254,7 @@ fn print_results_multifile(
         }
 
         println!(
-            "     {:width$}   Scale: {:.2} to {:.2} (1.0 = same speed)",
+            "     {:width$}   Scale: {:.2} to {:.2} (1.0 = same speed, '+' marks 1.0)",
             "",
             scale_min,
             scale_max,
