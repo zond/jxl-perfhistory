@@ -1290,6 +1290,26 @@ fn print_results_multifile(
 // Markdown Output Helper Functions
 // ============================================================================
 
+/// Extract GitHub repository URL from git remote
+fn get_github_repo_url(repo: &Repository) -> Option<String> {
+    // Try to get the remote URL
+    let remote = repo.find_remote("origin").ok()?;
+    let url = remote.url()?;
+
+    // Parse GitHub URL (supports both SSH and HTTPS)
+    // SSH: git@github.com:owner/repo.git
+    // HTTPS: https://github.com/owner/repo.git
+    if let Some(captures) = url.strip_prefix("git@github.com:") {
+        Some(format!("https://github.com/{}", captures.trim_end_matches(".git")))
+    } else if let Some(captures) = url.strip_prefix("https://github.com/") {
+        Some(format!("https://github.com/{}", captures.trim_end_matches(".git")))
+    } else if let Some(captures) = url.strip_prefix("http://github.com/") {
+        Some(format!("https://github.com/{}", captures.trim_end_matches(".git")))
+    } else {
+        None
+    }
+}
+
 /// Format confidence interval as "median ± error"
 fn format_ci(median: f64, rel_error: f64) -> String {
     let half_width = median * rel_error;
@@ -1331,10 +1351,18 @@ fn markdown_details(summary: &str, content: &str) -> String {
 fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metrics: &NoiseMetrics) {
     let file_name = args.jxl_file.as_deref().unwrap_or("unknown");
 
+    // Get GitHub repo URL for commit links
+    let repo = Repository::open(".").ok();
+    let github_url = repo.as_ref().and_then(get_github_repo_url);
+
     // Header
     println!("# 🚀 JPEG XL Performance Benchmark\n");
     println!("> **File**: `{}`", file_name);
-    println!("> **Repository**: https://github.com/zond/jxl-perfhistory");
+    if let Some(ref url) = github_url {
+        println!("> **Repository**: {}", url);
+    } else {
+        println!("> **Repository**: https://github.com/zond/jxl-perfhistory");
+    }
     println!("> **CPU Architecture**: {}\n", std::env::consts::ARCH);
     println!("---\n");
 
@@ -1384,8 +1412,15 @@ fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metric
             &format!("×{:.2}", ratio)
         };
 
-        println!("| {} | `{:.8}` | {} | {} | {} |",
-                 i + 1, result.oid, summary, ci, status);
+        // Format commit as link if GitHub URL available
+        let commit_str = if let Some(ref url) = github_url {
+            format!("[`{:.8}`]({}/commit/{})", result.oid, url, result.oid)
+        } else {
+            format!("`{:.8}`", result.oid)
+        };
+
+        println!("| {} | {} | {} | {} | {} |",
+                 i + 1, commit_str, summary, ci, status);
     }
 
     println!();
@@ -1433,11 +1468,19 @@ fn print_results_multifile_markdown(
     args: &Args,
     noise_metrics: &NoiseMetrics,
 ) {
+    // Get GitHub repo URL for commit links
+    let repo = Repository::open(".").ok();
+    let github_url = repo.as_ref().and_then(get_github_repo_url);
+
     // Header
     println!("# 🎯 JPEG XL Multi-File Performance Benchmark\n");
     println!("> **Files Tested**: {}", results[0].file_results.len());
     println!("> **Revisions**: {}", results.len());
-    println!("> **Repository**: https://github.com/zond/jxl-perfhistory\n");
+    if let Some(ref url) = github_url {
+        println!("> **Repository**: {}\n", url);
+    } else {
+        println!("> **Repository**: https://github.com/zond/jxl-perfhistory\n");
+    }
     println!("---\n");
 
     // Configuration
@@ -1467,8 +1510,20 @@ fn print_results_multifile_markdown(
         let current_rev = &results[i];
         let prev_rev = &results[i + 1];
 
-        println!("### [{}] `{:.8}` - {}", i + 1, current_rev.oid, current_rev.clipped_summary(60));
-        println!("**vs** `{:.8}` - {}\n", prev_rev.oid, prev_rev.clipped_summary(60));
+        // Format commits as links if GitHub URL available
+        let current_commit = if let Some(ref url) = github_url {
+            format!("[`{:.8}`]({}/commit/{})", current_rev.oid, url, current_rev.oid)
+        } else {
+            format!("`{:.8}`", current_rev.oid)
+        };
+        let prev_commit = if let Some(ref url) = github_url {
+            format!("[`{:.8}`]({}/commit/{})", prev_rev.oid, url, prev_rev.oid)
+        } else {
+            format!("`{:.8}`", prev_rev.oid)
+        };
+
+        println!("### [{}] {} - {}", i + 1, current_commit, current_rev.clipped_summary(60));
+        println!("**vs** {} - {}\n", prev_commit, prev_rev.clipped_summary(60));
 
         // Collect ratio stats for all files
         let mut all_ratios: Vec<(String, f64, f64, f64)> = vec![];
@@ -1511,8 +1566,15 @@ fn print_results_multifile_markdown(
     // Baseline reference
     let oldest_rev = &results[results.len() - 1];
     println!("## 📌 Baseline\n");
-    println!("**[{}]** `{:.8}` - {} (oldest revision)\n",
-             results.len(), oldest_rev.oid, oldest_rev.clipped_summary(60));
+
+    let oldest_commit = if let Some(ref url) = github_url {
+        format!("[`{:.8}`]({}/commit/{})", oldest_rev.oid, url, oldest_rev.oid)
+    } else {
+        format!("`{:.8}`", oldest_rev.oid)
+    };
+
+    println!("**[{}]** {} - {} (oldest revision)\n",
+             results.len(), oldest_commit, oldest_rev.clipped_summary(60));
     println!("---\n");
 
     println!("<sup>Generated by jxl-perfhistory</sup>");
