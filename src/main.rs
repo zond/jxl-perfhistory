@@ -12,7 +12,7 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::result;
@@ -93,13 +93,6 @@ struct Args {
     /// Comma-separated list of process names to pause during benchmarking (e.g., "chrome,firefox")
     #[arg(long = "pause-processes", value_delimiter = ',')]
     pause_processes: Vec<String>,
-}
-
-macro_rules! print_flush {
-    ($($arg:tt)*) => {{
-        print!($($arg)*);
-        io::stdout().flush().unwrap();
-    }};
 }
 
 /// System noise metrics collected before benchmarking
@@ -208,7 +201,7 @@ fn unpause_processes(processes: &[String]) {
     if processes.is_empty() {
         return;
     }
-    println!("Resuming processes: {}", processes.join(", "));
+    eprintln!("Resuming processes: {}", processes.join(", "));
     for name in processes {
         let output = Command::new("killall").args(["-SIGCONT", name]).output();
         if let Ok(output) = output
@@ -231,7 +224,7 @@ struct ProcessPauser {
 impl ProcessPauser {
     fn new(processes: Vec<String>) -> Result<Self> {
         if !processes.is_empty() {
-            println!("Pausing processes: {}", processes.join(", "));
+            eprintln!("Pausing processes: {}", processes.join(", "));
             for name in &processes {
                 let output = Command::new("killall").args(["-SIGSTOP", name]).output()?;
                 if !output.status.success() {
@@ -821,14 +814,14 @@ fn main() -> Result<()> {
     let mut mi = MedianIndices::new(args.confidence)?;
 
     // Check system noise before starting
-    print_flush!("Calibrating system noise...");
+    eprint!("Calibrating system noise...");
     let noise_metrics = NoiseMetrics::measure(10);
     if let (Some(load), Some(cv)) = (noise_metrics.load_average, noise_metrics.calibration_cv) {
-        println!("done (load: {:.2}, CV: {:.1}%)", load, cv * 100.0);
+        eprintln!("done (load: {:.2}, CV: {:.1}%)", load, cv * 100.0);
     } else if let Some(cv) = noise_metrics.calibration_cv {
-        println!("done (CV: {:.1}%)", cv * 100.0);
+        eprintln!("done (CV: {:.1}%)", cv * 100.0);
     } else {
-        println!("done");
+        eprintln!("done");
     }
 
     if noise_metrics.is_noisy() && !args.ignore_noisy_system {
@@ -858,7 +851,7 @@ fn main() -> Result<()> {
     for rev in &revisions {
         if is_revision_finished(rev, args.min_measurements, args.rel_error) {
             let fr = &rev.file_results[0];
-            println!(
+            eprintln!(
                 "{:.8}: {:<50} is already done, {} samples, median/error: {:.2}/{:.4}",
                 rev.oid,
                 rev.clipped_summary(50),
@@ -878,9 +871,9 @@ fn main() -> Result<()> {
         .filter(|rev| !is_revision_finished(rev, args.min_measurements, args.rel_error))
     {
         checkout_revision(&repo, rev.oid)?;
-        print_flush!("Building {}: {}...", rev.oid, rev.summary);
+        eprint!("Building {}: {}...", rev.oid, rev.summary);
         rev.build(binary_dir)?;
-        println!("done!");
+        eprintln!("done!");
     }
 
     // Restore repo (explicit for error handling, guard is safety net)
@@ -903,7 +896,7 @@ fn main() -> Result<()> {
         let rev = &mut revisions[rev_idx];
         let fr = &rev.file_results[file_idx];
         if is_multi_file {
-            print_flush!(
+            eprint!(
                 "Benchmarking {:.8} [{}]...",
                 rev.oid,
                 Path::new(&fr.file_path)
@@ -912,7 +905,7 @@ fn main() -> Result<()> {
                     .to_string_lossy()
             );
         } else {
-            print_flush!(
+            eprint!(
                 "Benchmarking {:.8}: {:<50}...",
                 rev.oid,
                 rev.clipped_summary(50)
@@ -924,21 +917,21 @@ fn main() -> Result<()> {
         let old_relative_error = fr.rel_error;
 
         if let Err(InsufficientSamples(_)) = fr.compute_median(&mut mi) {
-            println!("done!");
+            eprintln!("done!");
         } else {
-            print!(
+            eprint!(
                 "done! {} samples, median {:.2}",
                 fr.n_measurements(),
                 fr.median.unwrap()
             );
             match old_relative_error {
-                None => print!(", error {:.4}", fr.rel_error.unwrap()),
-                Some(old) => print!(", error {:.4} => {:.4}", old, fr.rel_error.unwrap()),
+                None => eprint!(", error {:.4}", fr.rel_error.unwrap()),
+                Some(old) => eprint!(", error {:.4} => {:.4}", old, fr.rel_error.unwrap()),
             }
             if is_file_result_finished(fr, args.min_measurements, args.rel_error) {
-                println!(" is *GOOD ENOUGH*");
+                eprintln!(" is *GOOD ENOUGH*");
             } else {
-                println!();
+                eprintln!();
             }
             fr.close();
         }
