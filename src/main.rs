@@ -16,8 +16,46 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 use std::result;
+use std::sync::Mutex;
 use tempfile::TempDir;
 use thiserror::Error;
+
+/// Global cleanup state for Ctrl-C handler
+static CLEANUP_STATE: Mutex<CleanupState> = Mutex::new(CleanupState {
+    paused_processes: Vec::new(),
+    original_branch: None,
+});
+
+struct CleanupState {
+    paused_processes: Vec<String>,
+    original_branch: Option<String>,
+}
+
+fn setup_ctrlc_handler() {
+    ctrlc::set_handler(move || {
+        eprintln!("\nInterrupted, cleaning up...");
+        let state = CLEANUP_STATE.lock().unwrap();
+
+        // Resume paused processes
+        for name in &state.paused_processes {
+            let _ = Command::new("killall").args(["-SIGCONT", name]).output();
+        }
+        if !state.paused_processes.is_empty() {
+            eprintln!("Resumed processes: {}", state.paused_processes.join(", "));
+        }
+
+        // Restore original branch
+        if let Some(ref branch) = state.original_branch
+            && let Ok(repo) = Repository::open(".")
+        {
+            let _ = restore_repo(&repo, branch.clone());
+            eprintln!("Restored branch: {}", branch);
+        }
+
+        std::process::exit(130); // Standard exit code for Ctrl-C
+    })
+    .expect("Error setting Ctrl-C handler");
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "jxl-perfhistory")]
@@ -191,6 +229,8 @@ impl ProcessPauser {
                     }
                 }
             }
+            // Register with global state for Ctrl-C handler
+            CLEANUP_STATE.lock().unwrap().paused_processes = processes.clone();
         }
         Ok(Self { processes })
     }
@@ -207,7 +247,9 @@ impl ProcessPauser {
                     }
                 }
             }
-            self.processes.clear(); // Disarm
+            self.processes.clear();
+            // Unregister from global state
+            CLEANUP_STATE.lock().unwrap().paused_processes.clear();
         }
         Ok(())
     }
@@ -221,6 +263,8 @@ impl Drop for ProcessPauser {
             for name in &self.processes {
                 let _ = Command::new("killall").args(["-SIGCONT", name]).output();
             }
+            // Unregister from global state
+            CLEANUP_STATE.lock().unwrap().paused_processes.clear();
         }
     }
 }
@@ -232,6 +276,8 @@ struct RepoGuard {
 
 impl RepoGuard {
     fn new(original_ref_name: String) -> Self {
+        // Register with global state for Ctrl-C handler
+        CLEANUP_STATE.lock().unwrap().original_branch = Some(original_ref_name.clone());
         Self {
             original_ref_name: Some(original_ref_name),
         }
@@ -242,7 +288,9 @@ impl RepoGuard {
         if let Some(ref original_ref_name) = self.original_ref_name {
             let repo = Repository::open(".")?;
             restore_repo(&repo, original_ref_name.clone())?;
-            self.original_ref_name = None; // Disarm
+            self.original_ref_name = None;
+            // Unregister from global state
+            CLEANUP_STATE.lock().unwrap().original_branch = None;
         }
         Ok(())
     }
@@ -256,6 +304,8 @@ impl Drop for RepoGuard {
             if let Ok(repo) = Repository::open(".") {
                 let _ = restore_repo(&repo, original_ref_name.clone());
             }
+            // Unregister from global state
+            CLEANUP_STATE.lock().unwrap().original_branch = None;
         }
     }
 }
@@ -703,6 +753,7 @@ fn find_unfinished_pairs(
 
 fn main() -> Result<()> {
     color_eyre::install()?;
+    setup_ctrlc_handler();
     let args = Args::parse();
 
     // Parse file list from --file or --glob
@@ -754,131 +805,123 @@ fn main() -> Result<()> {
         ));
     }
 
-    let result: Result<()> = (|| {
-        let mut revisions = collect_revisions(
-            &repo,
-            args.revisions,
-            args.data_directory.as_deref().map(Path::new),
-            &files,
-        )?;
+    let mut revisions = collect_revisions(
+        &repo,
+        args.revisions,
+        args.data_directory.as_deref().map(Path::new),
+        &files,
+    )?;
 
-        // Compute medians for any file results that have enough measurements
-        for rev in &mut revisions {
-            for fr in &mut rev.file_results {
-                let _ = fr.compute_median(&mut mi);
-            }
+    // Compute medians for any file results that have enough measurements
+    for rev in &mut revisions {
+        for fr in &mut rev.file_results {
+            let _ = fr.compute_median(&mut mi);
+        }
+    }
+
+    // Report already-finished revisions
+    for rev in &revisions {
+        if is_revision_finished(rev, args.min_measurements, args.rel_error) {
+            let fr = &rev.file_results[0];
+            println!(
+                "{:.8}: {:<50} is already done, {} samples, median/error: {:.2}/{:.4}",
+                rev.oid,
+                rev.clipped_summary(50),
+                fr.n_measurements(),
+                fr.median.unwrap(),
+                fr.rel_error.unwrap()
+            );
+        }
+    }
+
+    // RAII guard ensures repo is restored even on error/panic
+    let mut repo_guard = RepoGuard::new(original_ref_name.clone());
+
+    // Build binaries for revisions that need benchmarking
+    for rev in revisions
+        .iter_mut()
+        .filter(|rev| !is_revision_finished(rev, args.min_measurements, args.rel_error))
+    {
+        checkout_revision(&repo, rev.oid)?;
+        print_flush!("Building {}: {}...", rev.oid, rev.summary);
+        rev.build(binary_dir)?;
+        println!("done!");
+    }
+
+    // Restore repo (explicit for error handling, guard is safety net)
+    repo_guard.restore()?;
+
+    // RAII guard ensures processes are resumed even on error/panic
+    let mut process_pauser = ProcessPauser::new(args.pause_processes.clone())?;
+
+    // Benchmark loop: randomly sample unfinished (revision, file) pairs
+    loop {
+        let unfinished_pairs =
+            find_unfinished_pairs(&revisions, args.min_measurements, args.rel_error);
+        if unfinished_pairs.is_empty() {
+            break;
         }
 
-        // Report already-finished revisions
-        for rev in &revisions {
-            if is_revision_finished(rev, args.min_measurements, args.rel_error) {
-                let fr = &rev.file_results[0];
-                println!(
-                    "{:.8}: {:<50} is already done, {} samples, median/error: {:.2}/{:.4}",
-                    rev.oid,
-                    rev.clipped_summary(50),
-                    fr.n_measurements(),
-                    fr.median.unwrap(),
-                    fr.rel_error.unwrap()
-                );
-            }
-        }
+        let pair_idx = rng.random_range(0..unfinished_pairs.len());
+        let (rev_idx, file_idx) = unfinished_pairs[pair_idx];
 
-        // Build binaries for revisions that need benchmarking
-        let unfinished_rev_indices: Vec<usize> = revisions
-            .iter()
-            .enumerate()
-            .filter(|(_, rev)| !is_revision_finished(rev, args.min_measurements, args.rel_error))
-            .map(|(i, _)| i)
-            .collect();
-
-        // RAII guard ensures repo is restored even on error/panic
-        let mut repo_guard = RepoGuard::new(original_ref_name.clone());
-
-        for &rev_idx in &unfinished_rev_indices {
-            let rev = &mut revisions[rev_idx];
-            checkout_revision(&repo, rev.oid)?;
-            print_flush!("Building {}: {}...", rev.oid, rev.summary);
-            rev.build(binary_dir)?;
-            println!("done!");
-        }
-
-        // Restore repo (explicit for error handling, guard is safety net)
-        repo_guard.restore()?;
-
-        // RAII guard ensures processes are resumed even on error/panic
-        let mut process_pauser = ProcessPauser::new(args.pause_processes.clone())?;
-
-        // Benchmark loop: randomly sample unfinished (revision, file) pairs
-        loop {
-            let unfinished_pairs =
-                find_unfinished_pairs(&revisions, args.min_measurements, args.rel_error);
-            if unfinished_pairs.is_empty() {
-                break;
-            }
-
-            let pair_idx = rng.random_range(0..unfinished_pairs.len());
-            let (rev_idx, file_idx) = unfinished_pairs[pair_idx];
-
-            let rev = &mut revisions[rev_idx];
-            let fr = &rev.file_results[file_idx];
-            if is_multi_file {
-                print_flush!(
-                    "Benchmarking {:.8} [{}]...",
-                    rev.oid,
-                    Path::new(&fr.file_path)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                );
-            } else {
-                print_flush!(
-                    "Benchmarking {:.8}: {:<50}...",
-                    rev.oid,
-                    rev.clipped_summary(50)
-                );
-            }
-
-            rev.benchmark(file_idx)?;
-            let fr = &mut rev.file_results[file_idx];
-            let old_relative_error = fr.rel_error;
-
-            if let Err(InsufficientSamples(_)) = fr.compute_median(&mut mi) {
-                println!("done!");
-            } else {
-                print!(
-                    "done! {} samples, median {:.2}",
-                    fr.n_measurements(),
-                    fr.median.unwrap()
-                );
-                match old_relative_error {
-                    None => print!(", error {:.4}", fr.rel_error.unwrap()),
-                    Some(old) => print!(", error {:.4} => {:.4}", old, fr.rel_error.unwrap()),
-                }
-                if is_file_result_finished(fr, args.min_measurements, args.rel_error) {
-                    println!(" is *GOOD ENOUGH*");
-                } else {
-                    println!();
-                }
-                fr.close();
-            }
-        }
-
-        // Resume paused processes (explicit for error handling, guard is safety net)
-        process_pauser.resume()?;
-
-        // Sort by ordinal for display
-        revisions.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
-
+        let rev = &mut revisions[rev_idx];
+        let fr = &rev.file_results[file_idx];
         if is_multi_file {
-            print_results_multifile(&revisions, &mut mi, &noise_metrics);
+            print_flush!(
+                "Benchmarking {:.8} [{}]...",
+                rev.oid,
+                Path::new(&fr.file_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
         } else {
-            print_results_single(&revisions, &args, &noise_metrics);
+            print_flush!(
+                "Benchmarking {:.8}: {:<50}...",
+                rev.oid,
+                rev.clipped_summary(50)
+            );
         }
-        Ok(())
-    })();
 
-    result
+        rev.benchmark(file_idx)?;
+        let fr = &mut rev.file_results[file_idx];
+        let old_relative_error = fr.rel_error;
+
+        if let Err(InsufficientSamples(_)) = fr.compute_median(&mut mi) {
+            println!("done!");
+        } else {
+            print!(
+                "done! {} samples, median {:.2}",
+                fr.n_measurements(),
+                fr.median.unwrap()
+            );
+            match old_relative_error {
+                None => print!(", error {:.4}", fr.rel_error.unwrap()),
+                Some(old) => print!(", error {:.4} => {:.4}", old, fr.rel_error.unwrap()),
+            }
+            if is_file_result_finished(fr, args.min_measurements, args.rel_error) {
+                println!(" is *GOOD ENOUGH*");
+            } else {
+                println!();
+            }
+            fr.close();
+        }
+    }
+
+    // Resume paused processes (explicit for error handling, guard is safety net)
+    process_pauser.resume()?;
+
+    // Sort by ordinal for display
+    revisions.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
+
+    if is_multi_file {
+        print_results_multifile(&revisions, &mut mi, &noise_metrics);
+    } else {
+        print_results_single(&revisions, &args, &noise_metrics);
+    }
+
+    Ok(())
 }
 
 fn print_header(title: &str, noise_metrics: &NoiseMetrics, width: usize) {
