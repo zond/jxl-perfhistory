@@ -93,6 +93,10 @@ struct Args {
     /// Comma-separated list of process names to pause during benchmarking (e.g., "chrome,firefox")
     #[arg(long = "pause-processes", value_delimiter = ',')]
     pause_processes: Vec<String>,
+
+    /// Output results in GitHub-flavored markdown format
+    #[arg(long = "markdown")]
+    markdown: bool,
 }
 
 /// System noise metrics collected before benchmarking
@@ -944,9 +948,17 @@ fn main() -> Result<()> {
     revisions.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
 
     if is_multi_file {
-        print_results_multifile(&revisions, &mut mi, &args, &noise_metrics);
+        if args.markdown {
+            print_results_multifile_markdown(&revisions, &mut mi, &args, &noise_metrics);
+        } else {
+            print_results_multifile(&revisions, &mut mi, &args, &noise_metrics);
+        }
     } else {
-        print_results_single(&revisions, &args, &noise_metrics);
+        if args.markdown {
+            print_results_single_markdown(&revisions, &args, &noise_metrics);
+        } else {
+            print_results_single(&revisions, &args, &noise_metrics);
+        }
     }
 
     Ok(())
@@ -1273,3 +1285,295 @@ fn print_results_multifile(
 
     println!("\n{}", "=".repeat(100));
 }
+
+// ============================================================================
+// Markdown Output Helper Functions
+// ============================================================================
+
+/// Extract GitHub repository URL from git remote
+fn get_github_repo_url(repo: &Repository) -> Option<String> {
+    // Try to get the remote URL
+    let remote = repo.find_remote("origin").ok()?;
+    let url = remote.url()?;
+
+    // Parse GitHub URL (supports both SSH and HTTPS)
+    // SSH: git@github.com:owner/repo.git
+    // HTTPS: https://github.com/owner/repo.git
+    if let Some(captures) = url.strip_prefix("git@github.com:") {
+        Some(format!("https://github.com/{}", captures.trim_end_matches(".git")))
+    } else if let Some(captures) = url.strip_prefix("https://github.com/") {
+        Some(format!("https://github.com/{}", captures.trim_end_matches(".git")))
+    } else if let Some(captures) = url.strip_prefix("http://github.com/") {
+        Some(format!("https://github.com/{}", captures.trim_end_matches(".git")))
+    } else {
+        None
+    }
+}
+
+/// Format confidence interval as "median ± error"
+fn format_ci(median: f64, rel_error: f64) -> String {
+    let half_width = median * rel_error;
+    format!("{:.2} ± {:.2}", median, half_width)
+}
+
+/// Format performance ratio with significance indicator
+fn format_ratio_indicator(ratio: f64, ci_lower: f64, ci_upper: f64) -> String {
+    if ci_lower > 1.0 {
+        format!("🚀 **Faster** ({:.3}×)", ratio)
+    } else if ci_upper < 1.0 {
+        format!("🐌 **Slower** ({:.3}×)", ratio)
+    } else {
+        format!("Similar ({:.3}×)", ratio)
+    }
+}
+
+/// Create Unicode block bar for visual representation
+fn create_markdown_bar(value: f64, min: f64, max: f64, width: usize) -> String {
+    let range = max - min;
+    if range == 0.0 {
+        return "▰".repeat(width);
+    }
+    let filled = ((value - min) / range * width as f64) as usize;
+    let filled = filled.min(width);
+    let empty = width - filled;
+    format!("{}{}", "▰".repeat(filled), "░".repeat(empty))
+}
+
+/// Format file name with link to conformance repo and preview image
+fn format_file_with_preview(file_name: &str) -> String {
+    // Extract base name without extension (e.g., "bike.jxl" -> "bike")
+    let base_name = file_name.strip_suffix(".jxl").unwrap_or(file_name);
+
+    // Create link to conformance repo testcase directory
+    let conformance_url = format!("https://github.com/libjxl/conformance/tree/master/testcases/{}", base_name);
+
+    // Create preview image from ref.png (100px width)
+    let preview_url = format!("https://raw.githubusercontent.com/libjxl/conformance/master/testcases/{}/ref.png", base_name);
+
+    // Format: image preview + line break + linked filename
+    // Using HTML img tag with proper attribute syntax
+    format!("<img src='{}' width='100'><br>[{}]({})", preview_url, file_name, conformance_url)
+}
+
+// ============================================================================
+// Markdown Output Functions
+// ============================================================================
+
+fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metrics: &NoiseMetrics) {
+    let file_name = args.jxl_file.as_deref().unwrap_or("unknown");
+
+    // Get GitHub repo URL for commit links
+    let repo = Repository::open(".").ok();
+    let github_url = repo.as_ref().and_then(get_github_repo_url);
+
+    // Header
+    println!("# 🚀 JPEG XL Performance Benchmark\n");
+
+    // Benchmark info table
+    let file_display = format_file_with_preview(file_name);
+    let repo_url = if let Some(ref url) = github_url {
+        url.clone()
+    } else {
+        "https://github.com/zond/jxl-perfhistory".to_string()
+    };
+
+    println!("| | |");
+    println!("|---|---|");
+    println!("| **File** | {} |", file_display);
+    println!("| **Repository** | {} |", repo_url);
+    println!("| **CPU Architecture** | {} |\n", std::env::consts::ARCH);
+    println!("---\n");
+
+    // Calculate statistics
+    let mut min = f64::MAX;
+    let mut max = f64::MIN;
+    let mut sum = 0f64;
+    for rev in results.iter() {
+        let m = rev.file_results[0].median.unwrap();
+        min = min.min(m);
+        max = max.max(m);
+        sum += m;
+    }
+    let avg = sum / results.len() as f64;
+    let improvement = ((max - min) / min) * 100.0;
+
+    // Summary Statistics
+    println!("## 📊 Summary Statistics\n");
+    println!("| Metric | Value |");
+    println!("|--------|-------|");
+    println!("| Revisions Tested | {} |", results.len());
+    println!("| Confidence Level | {:.1}% |", 100f64 * args.confidence);
+    println!("| Max Relative Error | {:.1}% |", 100f64 * args.rel_error);
+    println!("| Min Speed | {:.2} pixels/s |", min);
+    println!("| Max Speed | {:.2} pixels/s |", max);
+    println!("| Average Speed | {:.2} pixels/s |", avg);
+    println!("| **Total Improvement** | **{:.1}%** |\n", improvement);
+    println!("---\n");
+
+    // Performance Results Table
+    println!("## 📈 Performance Results\n");
+    println!("| # | Commit | Message | Performance | Speed (pixels/s) | Status |");
+    println!("|---|--------|---------|-------------|------------------|--------|");
+
+    const TABLE_BAR_WIDTH: usize = 20;
+    for (i, result) in results.iter().enumerate() {
+        let fr = &result.file_results[0];
+        let median = fr.median.unwrap();
+        let ci = format_ci(median, fr.rel_error.unwrap());
+        let summary = result.clipped_summary(40);
+
+        // Create visual bar
+        let bar = create_markdown_bar(median, min, max, TABLE_BAR_WIDTH);
+
+        let status = if median == max {
+            "🏆 MAX"
+        } else if median == min {
+            "🔻 MIN"
+        } else {
+            let ratio = median / max;
+            &format!("×{:.2}", ratio)
+        };
+
+        // Format commit as link if GitHub URL available
+        let commit_str = if let Some(ref url) = github_url {
+            format!("[{:.8}]({}/commit/{})", result.oid, url, result.oid)
+        } else {
+            format!("`{:.8}`", result.oid)
+        };
+
+        println!("| {} | {} | {} | {} | {} | {} |",
+                 i + 1, commit_str, summary, bar, ci, status);
+    }
+
+    println!();
+
+    // System warnings if present
+    if let Some(warning) = noise_metrics.warning_message() {
+        println!("## ⚠️ System Information\n");
+        println!("> **Note**: {}\n", warning);
+        println!("---\n");
+    }
+
+    println!("---");
+    println!("<sup>Generated by jxl-perfhistory</sup>");
+}
+
+fn print_results_multifile_markdown(
+    results: &[Revision],
+    mi: &mut MedianIndices,
+    args: &Args,
+    noise_metrics: &NoiseMetrics,
+) {
+    // Get GitHub repo URL for commit links
+    let repo = Repository::open(".").ok();
+    let github_url = repo.as_ref().and_then(get_github_repo_url);
+
+    // Header
+    println!("# 🎯 JPEG XL Multi-File Performance Benchmark\n");
+    println!("> **Files Tested**: {}", results[0].file_results.len());
+    println!("> **Revisions**: {}", results.len());
+    if let Some(ref url) = github_url {
+        println!("> **Repository**: {}\n", url);
+    } else {
+        println!("> **Repository**: https://github.com/zond/jxl-perfhistory\n");
+    }
+    println!("---\n");
+
+    // Configuration
+    println!("## 📊 Configuration\n");
+    println!("| Setting | Value |");
+    println!("|---------|-------|");
+    println!("| Confidence Level | {:.1}% |", 100f64 * args.confidence);
+    println!("| Max Relative Error | {:.1}% |", 100f64 * args.rel_error);
+    println!("| CPU Architecture | {} |\n", std::env::consts::ARCH);
+    println!("---\n");
+
+    // System warnings if present
+    if let Some(warning) = noise_metrics.warning_message() {
+        println!("> ⚠️ **System Note**: {}\n", warning);
+        println!("---\n");
+    }
+
+    if results.len() < 2 {
+        println!("Need at least 2 revisions to show comparisons.");
+        return;
+    }
+
+    println!("## 📈 Revision-by-Revision Analysis\n");
+
+    // For each revision (except oldest), show comparison to previous
+    for i in 0..(results.len() - 1) {
+        let current_rev = &results[i];
+        let prev_rev = &results[i + 1];
+
+        // Format commits as links if GitHub URL available
+        let current_commit = if let Some(ref url) = github_url {
+            format!("[{:.8}]({}/commit/{})", current_rev.oid, url, current_rev.oid)
+        } else {
+            format!("`{:.8}`", current_rev.oid)
+        };
+        let prev_commit = if let Some(ref url) = github_url {
+            format!("[{:.8}]({}/commit/{})", prev_rev.oid, url, prev_rev.oid)
+        } else {
+            format!("`{:.8}`", prev_rev.oid)
+        };
+
+        println!("### [{}] {} - {}", i + 1, current_commit, current_rev.clipped_summary(60));
+        println!("**vs** {} - {}\n", prev_commit, prev_rev.clipped_summary(60));
+
+        // Collect ratio stats for all files
+        let mut all_ratios: Vec<(String, f64, f64, f64)> = vec![];
+
+        for (file_idx, current_fr) in current_rev.file_results.iter().enumerate() {
+            let prev_fr = &prev_rev.file_results[file_idx];
+
+            if let (Some(prev_median), Some(_)) = (prev_fr.median, current_fr.median)
+                && let Some((ratio, ci_lo, ci_hi)) =
+                    compute_ratio_stats(&current_fr.measurement_file.measurements, prev_median, mi)
+            {
+                let file_name = Path::new(&current_fr.file_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                all_ratios.push((file_name, ratio, ci_lo, ci_hi));
+            }
+        }
+
+        if all_ratios.is_empty() {
+            println!("No valid comparisons available\n");
+            println!("---\n");
+            continue;
+        }
+
+        // Print table
+        println!("| File | Ratio vs Prev | CI Range | Assessment |");
+        println!("|------|---------------|----------|------------|");
+
+        for (file_name, ratio, ci_lo, ci_hi) in &all_ratios {
+            let assessment = format_ratio_indicator(*ratio, *ci_lo, *ci_hi);
+            let file_display = format_file_with_preview(file_name);
+            println!("| {} | {:.3} | [{:.3}, {:.3}] | {} |",
+                     file_display, ratio, ci_lo, ci_hi, assessment);
+        }
+
+        println!("\n---\n");
+    }
+
+    // Baseline reference
+    let oldest_rev = &results[results.len() - 1];
+    println!("## 📌 Baseline\n");
+
+    let oldest_commit = if let Some(ref url) = github_url {
+        format!("[{:.8}]({}/commit/{})", oldest_rev.oid, url, oldest_rev.oid)
+    } else {
+        format!("`{:.8}`", oldest_rev.oid)
+    };
+
+    println!("**[{}]** {} - {} (oldest revision)\n",
+             results.len(), oldest_commit, oldest_rev.clipped_summary(60));
+    println!("---\n");
+
+    println!("<sup>Generated by jxl-perfhistory</sup>");
+}
+
