@@ -1339,6 +1339,21 @@ fn create_markdown_bar(value: f64, min: f64, max: f64, width: usize) -> String {
     format!("{}{}", "▰".repeat(filled), "░".repeat(empty))
 }
 
+/// Format file name with link to conformance repo and preview image
+fn format_file_with_preview(file_name: &str) -> String {
+    // Extract base name without extension (e.g., "bike.jxl" -> "bike")
+    let base_name = file_name.strip_suffix(".jxl").unwrap_or(file_name);
+
+    // Create link to conformance repo testcase directory
+    let conformance_url = format!("https://github.com/libjxl/conformance/tree/master/testcases/{}", base_name);
+
+    // Create preview image from ref.png (20px width)
+    let preview_url = format!("https://raw.githubusercontent.com/libjxl/conformance/master/testcases/{}/ref.png", base_name);
+
+    // Format: image preview + linked filename
+    format!("<img src=\"{}\" width=\"20\" /> [{}]({})", preview_url, file_name, conformance_url)
+}
+
 // ============================================================================
 // Markdown Output Functions
 // ============================================================================
@@ -1529,8 +1544,9 @@ fn print_results_multifile_markdown(
 
         for (file_name, ratio, ci_lo, ci_hi) in &all_ratios {
             let assessment = format_ratio_indicator(*ratio, *ci_lo, *ci_hi);
-            println!("| `{}` | {:.3} | [{:.3}, {:.3}] | {} |",
-                     file_name, ratio, ci_lo, ci_hi, assessment);
+            let file_display = format_file_with_preview(file_name);
+            println!("| {} | {:.3} | [{:.3}, {:.3}] | {} |",
+                     file_display, ratio, ci_lo, ci_hi, assessment);
         }
 
         println!("\n---\n");
