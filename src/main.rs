@@ -1413,12 +1413,12 @@ fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metric
 
         // Format commit as link if GitHub URL available
         let commit_str = if let Some(ref url) = github_url {
-            format!("[`{:.8}`]({}/commit/{})", result.oid, url, result.oid)
+            format!("[{:.8}]({}/commit/{})", result.oid, url, result.oid)
         } else {
             format!("`{:.8}`", result.oid)
         };
 
-        println!("| {} | {} | {} | `{}` | {} | {} |",
+        println!("| {} | {} | {} | {} | {} | {} |",
                  i + 1, commit_str, summary, bar, ci, status);
     }
 
@@ -1485,12 +1485,12 @@ fn print_results_multifile_markdown(
 
         // Format commits as links if GitHub URL available
         let current_commit = if let Some(ref url) = github_url {
-            format!("[`{:.8}`]({}/commit/{})", current_rev.oid, url, current_rev.oid)
+            format!("[{:.8}]({}/commit/{})", current_rev.oid, url, current_rev.oid)
         } else {
             format!("`{:.8}`", current_rev.oid)
         };
         let prev_commit = if let Some(ref url) = github_url {
-            format!("[`{:.8}`]({}/commit/{})", prev_rev.oid, url, prev_rev.oid)
+            format!("[{:.8}]({}/commit/{})", prev_rev.oid, url, prev_rev.oid)
         } else {
             format!("`{:.8}`", prev_rev.oid)
         };
@@ -1541,7 +1541,7 @@ fn print_results_multifile_markdown(
     println!("## 📌 Baseline\n");
 
     let oldest_commit = if let Some(ref url) = github_url {
-        format!("[`{:.8}`]({}/commit/{})", oldest_rev.oid, url, oldest_rev.oid)
+        format!("[{:.8}]({}/commit/{})", oldest_rev.oid, url, oldest_rev.oid)
     } else {
         format!("`{:.8}`", oldest_rev.oid)
     };
