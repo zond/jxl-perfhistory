@@ -916,7 +916,7 @@ fn main() -> Result<()> {
     revisions.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
 
     if is_multi_file {
-        print_results_multifile(&revisions, &mut mi, &noise_metrics);
+        print_results_multifile(&revisions, &mut mi, &args, &noise_metrics);
     } else {
         print_results_single(&revisions, &args, &noise_metrics);
     }
@@ -1000,7 +1000,7 @@ fn print_results_single(results: &[Revision], args: &Args, noise_metrics: &Noise
     let avg = sum / results.len() as f64;
 
     println!("\nStatistics:");
-    println!("  Samples:            {:>15}", results.len());
+    println!("  Revisions:          {:>15}", results.len());
     println!("  Confidence:         {:>15.1}%", 100f64 * args.confidence);
     println!("  Max relative error: {:>15.1}%", 100f64 * args.rel_error);
     println!("  Min:                {:>15.2} pixels/s", min);
@@ -1104,6 +1104,7 @@ fn compute_ratio_stats(
 fn print_results_multifile(
     results: &[Revision],
     mi: &mut MedianIndices,
+    args: &Args,
     noise_metrics: &NoiseMetrics,
 ) {
     print_header(
@@ -1115,6 +1116,11 @@ fn print_results_multifile(
         noise_metrics,
         100,
     );
+
+    println!("\nStatistics:");
+    println!("  Revisions:          {:>15}", results.len());
+    println!("  Confidence:         {:>15.1}%", 100f64 * args.confidence);
+    println!("  Max relative error: {:>15.1}%", 100f64 * args.rel_error);
 
     // Skip the first (oldest) revision - nothing to compare to
     if results.len() < 2 {
