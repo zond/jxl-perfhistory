@@ -1339,11 +1339,6 @@ fn create_markdown_bar(value: f64, min: f64, max: f64, width: usize) -> String {
     format!("{}{}", "▰".repeat(filled), "░".repeat(empty))
 }
 
-/// Create collapsible details section
-fn markdown_details(summary: &str, content: &str) -> String {
-    format!("<details>\n<summary>{}</summary>\n\n{}\n</details>", summary, content)
-}
-
 // ============================================================================
 // Markdown Output Functions
 // ============================================================================
@@ -1394,14 +1389,18 @@ fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metric
 
     // Performance Results Table
     println!("## 📈 Performance Results\n");
-    println!("| # | Commit | Message | Speed (pixels/s) | Status |");
-    println!("|---|--------|---------|------------------|--------|");
+    println!("| # | Commit | Message | Performance | Speed (pixels/s) | Status |");
+    println!("|---|--------|---------|-------------|------------------|--------|");
 
+    const TABLE_BAR_WIDTH: usize = 20;
     for (i, result) in results.iter().enumerate() {
         let fr = &result.file_results[0];
         let median = fr.median.unwrap();
         let ci = format_ci(median, fr.rel_error.unwrap());
-        let summary = result.clipped_summary(50);
+        let summary = result.clipped_summary(40);
+
+        // Create visual bar
+        let bar = create_markdown_bar(median, min, max, TABLE_BAR_WIDTH);
 
         let status = if median == max {
             "🏆 MAX"
@@ -1419,37 +1418,11 @@ fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metric
             format!("`{:.8}`", result.oid)
         };
 
-        println!("| {} | {} | {} | {} | {} |",
-                 i + 1, commit_str, summary, ci, status);
+        println!("| {} | {} | {} | `{}` | {} | {} |",
+                 i + 1, commit_str, summary, bar, ci, status);
     }
 
     println!();
-
-    // Visual Performance Chart in collapsible section
-    let mut chart = String::new();
-    chart.push_str("```\n");
-
-    const BAR_WIDTH: usize = 40;
-    for (i, result) in results.iter().enumerate() {
-        let fr = &result.file_results[0];
-        let median = fr.median.unwrap();
-        let bar = create_markdown_bar(median, min, max, BAR_WIDTH);
-
-        let marker = if median == max {
-            " 🏆"
-        } else if median == min {
-            " 🔻"
-        } else {
-            ""
-        };
-
-        chart.push_str(&format!("[{:2}]  {}  {:.2} px/s{}\n",
-                               i + 1, bar, median, marker));
-    }
-
-    chart.push_str("```");
-
-    println!("{}\n", markdown_details("📊 Visual Performance Chart", &chart));
 
     // System warnings if present
     if let Some(warning) = noise_metrics.warning_message() {
