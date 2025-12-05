@@ -54,6 +54,10 @@ struct Args {
     /// Directory to store measurement data for resumable benchmarks
     #[arg(short = 'd', long = "data-directory")]
     data_directory: Option<String>,
+
+    /// Continue benchmarking even if system appears noisy
+    #[arg(long = "ignore-noisy-system")]
+    ignore_noisy_system: bool,
 }
 
 macro_rules! print_flush {
@@ -61,6 +65,107 @@ macro_rules! print_flush {
         print!($($arg)*);
         io::stdout().flush().unwrap();
     }};
+}
+
+/// System noise metrics collected before benchmarking
+struct NoiseMetrics {
+    load_average: Option<f64>,
+    calibration_cv: Option<f64>,
+}
+
+impl NoiseMetrics {
+    /// Check system load and run calibration benchmarks
+    fn measure(n_calibration_samples: usize) -> Self {
+        let load_average = Self::get_load_average();
+        let calibration_cv = Self::run_calibration(n_calibration_samples);
+        Self {
+            load_average,
+            calibration_cv: Some(calibration_cv),
+        }
+    }
+
+    /// Read system load average from /proc/loadavg (Linux only)
+    fn get_load_average() -> Option<f64> {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|content| {
+                content
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<f64>().ok())
+            })
+    }
+
+    /// Run a CPU+memory bound calibration to measure system noise.
+    /// Returns coefficient of variation (CV = stddev / mean).
+    fn run_calibration(n_samples: usize) -> f64 {
+        use std::time::Instant;
+
+        let mut measurements = Vec::with_capacity(n_samples);
+
+        // Allocate a 16MB buffer for memory-bound work
+        const BUFFER_SIZE: usize = 16 * 1024 * 1024;
+        let mut buffer = vec![0u8; BUFFER_SIZE];
+
+        for i in 0..n_samples {
+            // Fill buffer with varying data to prevent optimization
+            for (j, byte) in buffer.iter_mut().enumerate() {
+                *byte = ((i + j) & 0xFF) as u8;
+            }
+
+            let start = Instant::now();
+
+            // Hash the buffer multiple times for ~100ms of work
+            let mut hasher = Sha256::new();
+            for _ in 0..10 {
+                hasher.update(&buffer);
+            }
+            let _ = hasher.finalize();
+
+            let elapsed = start.elapsed().as_secs_f64();
+            measurements.push(elapsed);
+        }
+
+        // Compute CV = stddev / mean
+        let n = measurements.len() as f64;
+        let mean = measurements.iter().sum::<f64>() / n;
+        let variance = measurements.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let stddev = variance.sqrt();
+        stddev / mean
+    }
+
+    fn is_noisy(&self) -> bool {
+        // Consider system noisy if load > 1.0 or CV > 5%
+        self.load_average.is_some_and(|l| l > 1.0)
+            || self.calibration_cv.is_some_and(|cv| cv > 0.05)
+    }
+
+    fn warning_message(&self) -> Option<String> {
+        if !self.is_noisy() {
+            return None;
+        }
+
+        let mut warnings = vec![];
+        if let Some(load) = self.load_average {
+            if load > 1.0 {
+                warnings.push(format!("high system load ({:.2})", load));
+            }
+        }
+        if let Some(cv) = self.calibration_cv {
+            if cv > 0.05 {
+                warnings.push(format!("high calibration variance (CV={:.1}%)", cv * 100.0));
+            }
+        }
+
+        if warnings.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "WARNING: System appears noisy: {}. Results may be unreliable.",
+                warnings.join(", ")
+            ))
+        }
+    }
 }
 
 /// Handle for a measurement file that stays open for appending.
@@ -497,6 +602,30 @@ fn main() -> Result<()> {
     let original_ref_name = verify_repo(&repo)?;
     let mut mi = MedianIndices::new(args.confidence)?;
 
+    // Check system noise before starting
+    print_flush!("Calibrating system noise...");
+    let noise_metrics = NoiseMetrics::measure(10);
+    if let (Some(load), Some(cv)) = (noise_metrics.load_average, noise_metrics.calibration_cv) {
+        println!(
+            "done (load: {:.2}, CV: {:.1}%)",
+            load,
+            cv * 100.0
+        );
+    } else if let Some(cv) = noise_metrics.calibration_cv {
+        println!("done (CV: {:.1}%)", cv * 100.0);
+    } else {
+        println!("done");
+    }
+
+    if noise_metrics.is_noisy() && !args.ignore_noisy_system {
+        if let Some(warning) = noise_metrics.warning_message() {
+            eprintln!("{}", warning);
+        }
+        return Err(eyre!(
+            "System is too noisy for reliable benchmarks. Use --ignore-noisy-system to override."
+        ));
+    }
+
     let result: Result<()> = (|| {
         let mut revisions = collect_revisions(
             &repo,
@@ -603,9 +732,9 @@ fn main() -> Result<()> {
         revisions.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
 
         if is_multi_file {
-            print_results_multifile(&revisions, &mut mi);
+            print_results_multifile(&revisions, &mut mi, &noise_metrics);
         } else {
-            print_results_single(&revisions, &args);
+            print_results_single(&revisions, &args, &noise_metrics);
         }
         Ok(())
     })();
@@ -613,11 +742,68 @@ fn main() -> Result<()> {
     result
 }
 
-fn print_results_single(results: &[Revision], args: &Args) {
+fn print_header(title: &str, noise_metrics: &NoiseMetrics, width: usize) {
+    println!("\n{}", "=".repeat(width));
+    println!("{}", title);
+    println!("  https://github.com/zond/jxl-perfhistory");
+    println!("  CPU architecture: {}", std::env::consts::ARCH);
+    if let Some(warning) = noise_metrics.warning_message() {
+        println!("  {}", warning);
+    }
+    println!("{}", "=".repeat(width));
+}
+
+/// Draw a CI bar: ├───│───┤
+/// Returns the bar as a string
+fn draw_ci_bar(
+    pos_lower: usize,
+    pos_median: usize,
+    pos_upper: usize,
+    bar_width: usize,
+    baseline_pos: Option<usize>,
+) -> String {
+    let mut bar = vec![' '; bar_width];
+
+    // Draw baseline marker first (if provided)
+    if let Some(bp) = baseline_pos {
+        if bp < bar_width {
+            bar[bp] = '┃';
+        }
+    }
+
+    let lo = pos_lower.min(bar_width - 1);
+    let hi = pos_upper.min(bar_width - 1);
+    let med = pos_median.min(bar_width - 1);
+
+    bar[lo] = '├';
+    bar[hi] = '┤';
+
+    for c in bar.iter_mut().take(med).skip(lo + 1) {
+        if *c == '┃' {
+            *c = '╂'; // CI crosses baseline
+        } else {
+            *c = '─';
+        }
+    }
+    bar[med] = '│';
+    for c in bar.iter_mut().take(hi).skip(med + 1) {
+        if *c == '┃' {
+            *c = '╂';
+        } else {
+            *c = '─';
+        }
+    }
+
+    bar.into_iter().collect()
+}
+
+fn print_results_single(results: &[Revision], args: &Args, noise_metrics: &NoiseMetrics) {
     let file_name = args.jxl_file.as_deref().unwrap_or("unknown");
-    println!("\n{}", "=".repeat(80));
-    println!("BENCHMARK RESULTS using {}", file_name);
-    println!("{}", "=".repeat(80));
+    print_header(
+        &format!("BENCHMARK RESULTS using {}", file_name),
+        noise_metrics,
+        80,
+    );
 
     // Calculate statistics (using first file result from each revision)
     let mut min = f64::MAX;
@@ -674,18 +860,7 @@ fn print_results_single(results: &[Revision], args: &Args) {
         let pos_median = ((median - graph_min) / graph_range * (BAR_WIDTH - 1) as f64) as usize;
         let pos_upper = ((ci_upper - graph_min) / graph_range * (BAR_WIDTH - 1) as f64) as usize;
 
-        // Build the bar string
-        let mut bar = vec![' '; BAR_WIDTH];
-        bar[pos_lower] = '├';
-        for char in bar[(pos_lower + 1)..pos_median].iter_mut() {
-            *char = '─';
-        }
-        bar[pos_median] = '│';
-        for char in bar[(pos_median + 1)..pos_upper].iter_mut() {
-            *char = '─';
-        }
-        bar[pos_upper] = '┤';
-        let bar_str: String = bar.into_iter().collect();
+        let bar_str = draw_ci_bar(pos_lower, pos_median, pos_upper, BAR_WIDTH, None);
 
         let marker = if median == max {
             format!("▲ MAX ({:.2} / min)", max / min)
@@ -744,14 +919,16 @@ fn compute_ratio_stats(
     Some((median, ci_lower, ci_upper))
 }
 
-fn print_results_multifile(results: &[Revision], mi: &mut MedianIndices) {
-    println!("\n{}", "=".repeat(100));
-    println!(
-        "MULTI-FILE BENCHMARK RESULTS ({} files, {} revisions)",
-        results[0].file_results.len(),
-        results.len()
+fn print_results_multifile(results: &[Revision], mi: &mut MedianIndices, noise_metrics: &NoiseMetrics) {
+    print_header(
+        &format!(
+            "MULTI-FILE BENCHMARK RESULTS ({} files, {} revisions)",
+            results[0].file_results.len(),
+            results.len()
+        ),
+        noise_metrics,
+        100,
     );
-    println!("{}", "=".repeat(100));
 
     // Skip the first (oldest) revision - nothing to compare to
     if results.len() < 2 {
@@ -832,38 +1009,7 @@ fn print_results_multifile(results: &[Revision], mi: &mut MedianIndices) {
             let pos_median = ((ratio - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
             let pos_hi = ((ci_hi - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
 
-            // Build the bar
-            let mut bar = vec![' '; BAR_WIDTH];
-
-            // Draw baseline marker
-            if baseline_pos < BAR_WIDTH {
-                bar[baseline_pos] = '┃';
-            }
-
-            // Draw CI bar (overwriting baseline if overlapping)
-            let lo = pos_lo.min(BAR_WIDTH - 1);
-            let hi = pos_hi.min(BAR_WIDTH - 1);
-            let med = pos_median.min(BAR_WIDTH - 1);
-
-            bar[lo] = '├';
-            bar[hi] = '┤';
-            for c in bar.iter_mut().take(med).skip(lo + 1) {
-                if *c == '┃' {
-                    *c = '╂'; // CI crosses baseline
-                } else {
-                    *c = '─';
-                }
-            }
-            bar[med] = '│';
-            for c in bar.iter_mut().take(hi).skip(med + 1) {
-                if *c == '┃' {
-                    *c = '╂';
-                } else {
-                    *c = '─';
-                }
-            }
-
-            let bar_str: String = bar.into_iter().collect();
+            let bar_str = draw_ci_bar(pos_lo, pos_median, pos_hi, BAR_WIDTH, Some(baseline_pos));
 
             // Truncate or pad file name
             let display_name = if file_name.len() > max_name_len {
@@ -895,6 +1041,15 @@ fn print_results_multifile(results: &[Revision], mi: &mut MedianIndices) {
             width = max_name_len
         );
     }
+
+    // Show the oldest revision as baseline reference
+    let oldest_rev = &results[results.len() - 1];
+    println!(
+        "\n[{:2}] {:.8} {} (oldest, baseline for comparisons)",
+        results.len(),
+        oldest_rev.oid,
+        oldest_rev.clipped_summary(60)
+    );
 
     println!("\n{}", "=".repeat(100));
 }
