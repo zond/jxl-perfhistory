@@ -6,8 +6,10 @@
 use clap::Parser;
 use color_eyre::eyre::{Result, eyre};
 use git2::{Oid, Repository};
+use glob::glob;
 use memmap2::Mmap;
 use rand::Rng;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -25,9 +27,13 @@ struct Args {
     #[arg(short = 'r', long = "revisions", default_value = "10")]
     revisions: usize,
 
-    /// Path to the JXL file to decode
-    #[arg(short = 'f', long = "file")]
-    jxl_file: String,
+    /// Path to the JXL file to decode (mutually exclusive with --glob)
+    #[arg(short = 'f', long = "file", conflicts_with = "glob_pattern")]
+    jxl_file: Option<String>,
+
+    /// Glob pattern to select multiple JXL files (mutually exclusive with --file)
+    #[arg(short = 'g', long = "glob", conflicts_with = "jxl_file")]
+    glob_pattern: Option<String>,
 
     /// Required confidence interval for measured decoding speed
     #[arg(short = 'c', long = "confidence", default_value = "0.95")]
@@ -189,24 +195,38 @@ impl MedianIndices {
 #[error("Need at least 3 measurements, got {0}")]
 struct InsufficientSamples(usize);
 
-struct Revision {
-    oid: Oid,
-    summary: String,
-    binary_path: Option<String>,
+/// Compute hash of file path for stable storage naming
+fn file_path_hash(path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_bytes());
+    let result = hasher.finalize();
+    format!("{:x}", result)[..16].to_string()
+}
+
+/// Measurements and statistics for a single file within a revision
+struct FileResult {
+    file_path: String,
     measurement_file: MeasurementFile,
     median: Option<f64>,
     rel_error: Option<f64>,
-    ordinal: usize,
 }
 
-impl Revision {
+impl FileResult {
+    fn new(file_path: String, measurement_file: MeasurementFile) -> Self {
+        Self {
+            file_path,
+            measurement_file,
+            median: None,
+            rel_error: None,
+        }
+    }
+
+    fn n_measurements(&self) -> usize {
+        self.measurement_file.measurements.len()
+    }
+
     /// Compute credible interval for median using order statistics.
-    ///
-    /// Uses the Bayesian interpretation: with an uninformative prior,
-    /// the probability that the true median lies between X_(r) and X_(s)
-    /// is given by the Binomial(n, 0.5) distribution. This is both a valid
-    /// Bayesian credible interval and a frequentist confidence interval.
-    pub fn compute_median(
+    fn compute_median(
         &mut self,
         mi: &mut MedianIndices,
     ) -> result::Result<(), InsufficientSamples> {
@@ -216,20 +236,16 @@ impl Revision {
             return Err(InsufficientSamples(n));
         }
 
-        // Sort measurements to get order statistics
         let mut sorted = measurements.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        // Compute median
         let median = if n.is_multiple_of(2) {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]
         };
 
-        // Get CI indices using exact binomial probabilities
         let (lo, hi, _actual_confidence) = mi.get(n);
-
         let ci_lower = sorted[lo];
         let ci_upper = sorted[hi];
         let half_width = (ci_upper - ci_lower) / 2.0;
@@ -239,13 +255,25 @@ impl Revision {
         Ok(())
     }
 
-    pub fn n_measurements(&self) -> usize {
-        self.measurement_file.measurements.len()
+    fn close(&mut self) {
+        self.measurement_file.close();
     }
+}
 
-    pub fn benchmark(&mut self, jxl_file: &str) -> Result<()> {
+struct Revision {
+    oid: Oid,
+    summary: String,
+    binary_path: Option<String>,
+    file_results: Vec<FileResult>,
+    ordinal: usize,
+}
+
+impl Revision {
+    /// Benchmark a specific file and append the result to its measurements
+    pub fn benchmark(&mut self, file_idx: usize) -> Result<()> {
+        let file_result = &mut self.file_results[file_idx];
         let output = Command::new(self.binary_path.as_ref().unwrap())
-            .arg(jxl_file)
+            .arg(&file_result.file_path)
             .args(["--speedtest", "--num-reps", "1"])
             .output()?;
         if !output.status.success() {
@@ -263,9 +291,10 @@ impl Revision {
             .ok_or_else(|| eyre!("Can't find decoding speed in `{}`", stdout))?
             .parse()
             .map_err(|e| eyre!("Can't parse decoding speed: {}", e))?;
-        self.measurement_file.append(pixels_per_sec)?;
+        file_result.measurement_file.append(pixels_per_sec)?;
         Ok(())
     }
+
     pub fn build(&mut self, binary_dir: &Path) -> Result<()> {
         let binary_path = binary_dir.join(self.oid.to_string());
         self.binary_path = Some(binary_path.to_string_lossy().to_string());
@@ -310,6 +339,7 @@ fn collect_revisions(
     repo: &Repository,
     count: usize,
     data_dir: Option<&Path>,
+    files: &[String],
 ) -> Result<Vec<Revision>> {
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
@@ -321,13 +351,27 @@ fn collect_revisions(
             let oid = oid?;
             ordinal += 1;
 
-            let measurement_file = match data_dir {
-                Some(dir) => MeasurementFile::open(Path::new(&dir.join(oid.to_string())))?,
-                None => MeasurementFile {
-                    file: None,
-                    measurements: Vec::new(),
-                },
-            };
+            let file_results: Result<Vec<FileResult>> = files
+                .iter()
+                .map(|file_path| {
+                    let measurement_file = match data_dir {
+                        Some(dir) => {
+                            // Use hash-based naming for multi-file, plain oid for single file
+                            let file_name = if files.len() == 1 {
+                                oid.to_string()
+                            } else {
+                                format!("{}-{}", oid, file_path_hash(file_path))
+                            };
+                            MeasurementFile::open(&dir.join(file_name))?
+                        }
+                        None => MeasurementFile {
+                            file: None,
+                            measurements: Vec::new(),
+                        },
+                    };
+                    Ok(FileResult::new(file_path.clone(), measurement_file))
+                })
+                .collect();
 
             Ok(Revision {
                 oid,
@@ -337,9 +381,7 @@ fn collect_revisions(
                     .unwrap_or("(no message)")
                     .to_string(),
                 binary_path: None,
-                measurement_file,
-                median: None,
-                rel_error: None,
+                file_results: file_results?,
                 ordinal,
             })
         })
@@ -391,9 +433,58 @@ fn restore_repo(repo: &Repository, original_ref_name: String) -> Result<()> {
     Ok(())
 }
 
+/// Check if a file result is finished (has enough measurements with acceptable error)
+fn is_file_result_finished(fr: &FileResult, min_measurements: usize, max_rel_error: f64) -> bool {
+    fr.n_measurements() >= min_measurements
+        && fr.median.is_some()
+        && fr.rel_error.is_some_and(|e| e <= max_rel_error)
+}
+
+/// Check if all file results in a revision are finished
+fn is_revision_finished(rev: &Revision, min_measurements: usize, max_rel_error: f64) -> bool {
+    rev.file_results
+        .iter()
+        .all(|fr| is_file_result_finished(fr, min_measurements, max_rel_error))
+}
+
+/// Find unfinished (revision_idx, file_idx) pairs
+fn find_unfinished_pairs(
+    revisions: &[Revision],
+    min_measurements: usize,
+    max_rel_error: f64,
+) -> Vec<(usize, usize)> {
+    let mut pairs = vec![];
+    for (rev_idx, rev) in revisions.iter().enumerate() {
+        for (file_idx, fr) in rev.file_results.iter().enumerate() {
+            if !is_file_result_finished(fr, min_measurements, max_rel_error) {
+                pairs.push((rev_idx, file_idx));
+            }
+        }
+    }
+    pairs
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Args::parse();
+
+    // Parse file list from --file or --glob
+    let files: Vec<String> = if let Some(ref pattern) = args.glob_pattern {
+        let paths: Vec<_> = glob(pattern)?
+            .filter_map(|p| p.ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        if paths.is_empty() {
+            return Err(eyre!("No files matched the glob pattern: {}", pattern));
+        }
+        paths
+    } else if let Some(ref file) = args.jxl_file {
+        vec![file.clone()]
+    } else {
+        return Err(eyre!("Either --file or --glob must be provided"));
+    };
+
+    let is_multi_file = files.len() > 1;
 
     let mut rng = rand::rng();
     let tmp_dir = TempDir::new()?;
@@ -407,104 +498,133 @@ fn main() -> Result<()> {
     let mut mi = MedianIndices::new(args.confidence)?;
 
     let result: Result<()> = (|| {
-        let mut unfinished_revisions = vec![];
-        let mut finished_revisions = vec![];
-        for mut rev in collect_revisions(
+        let mut revisions = collect_revisions(
             &repo,
             args.revisions,
             args.data_directory.as_deref().map(Path::new),
-        )? {
-            if rev.n_measurements() < args.min_measurements {
-                unfinished_revisions.push(rev);
-            } else if let Err(InsufficientSamples(_)) = rev.compute_median(&mut mi) {
-                unfinished_revisions.push(rev);
-            } else if let Some(current_error) = rev.rel_error
-                && current_error <= args.rel_error
-            {
+            &files,
+        )?;
+
+        // Compute medians for any file results that have enough measurements
+        for rev in &mut revisions {
+            for fr in &mut rev.file_results {
+                let _ = fr.compute_median(&mut mi);
+            }
+        }
+
+        // Report already-finished revisions
+        for rev in &revisions {
+            if is_revision_finished(rev, args.min_measurements, args.rel_error) {
+                let fr = &rev.file_results[0];
                 println!(
                     "{:.8}: {:<50} is already done, {} samples, median/error: {:.2}/{:.4}",
                     rev.oid,
                     rev.clipped_summary(50),
-                    rev.n_measurements(),
-                    rev.median.unwrap(),
-                    rev.rel_error.unwrap()
+                    fr.n_measurements(),
+                    fr.median.unwrap(),
+                    fr.rel_error.unwrap()
                 );
-                finished_revisions.push(rev);
-            } else {
-                unfinished_revisions.push(rev);
             }
         }
 
-        for rev in &mut unfinished_revisions {
+        // Build binaries for revisions that need benchmarking
+        let unfinished_rev_indices: Vec<usize> = revisions
+            .iter()
+            .enumerate()
+            .filter(|(_, rev)| !is_revision_finished(rev, args.min_measurements, args.rel_error))
+            .map(|(i, _)| i)
+            .collect();
+
+        for &rev_idx in &unfinished_rev_indices {
+            let rev = &mut revisions[rev_idx];
             checkout_revision(&repo, rev.oid)?;
             print_flush!("Building {}: {}...", rev.oid, rev.summary);
             rev.build(binary_dir)?;
             println!("done!");
         }
-        restore_repo(&repo, original_ref_name)?;
+        restore_repo(&repo, original_ref_name.clone())?;
 
-        while !unfinished_revisions.is_empty() {
-            let idx = rng.random_range(0..unfinished_revisions.len());
-            let done_with_revision = {
-                let rev = &mut unfinished_revisions[idx];
+        // Benchmark loop: randomly sample unfinished (revision, file) pairs
+        loop {
+            let unfinished_pairs =
+                find_unfinished_pairs(&revisions, args.min_measurements, args.rel_error);
+            if unfinished_pairs.is_empty() {
+                break;
+            }
+
+            let pair_idx = rng.random_range(0..unfinished_pairs.len());
+            let (rev_idx, file_idx) = unfinished_pairs[pair_idx];
+
+            let rev = &mut revisions[rev_idx];
+            let fr = &rev.file_results[file_idx];
+            if is_multi_file {
+                print_flush!(
+                    "Benchmarking {:.8} [{}]...",
+                    rev.oid,
+                    Path::new(&fr.file_path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                );
+            } else {
                 print_flush!(
                     "Benchmarking {:.8}: {:<50}...",
                     rev.oid,
                     rev.clipped_summary(50)
                 );
-                rev.benchmark(&args.jxl_file)?;
-                let old_relative_error = rev.rel_error;
+            }
 
-                if let Err(InsufficientSamples(_)) = rev.compute_median(&mut mi) {
-                    println!("done!");
-                    false
-                } else if rev.n_measurements() >= args.min_measurements
-                    && rev.rel_error.unwrap() <= args.rel_error
-                {
-                    println!(
-                        "done! {} samples, median/error ({:.2}/{:.4} (from {:?})) is *GOOD ENOUGH*",
-                        rev.n_measurements(),
-                        rev.median.unwrap(),
-                        rev.rel_error.unwrap(),
-                        old_relative_error,
-                    );
-                    true
-                } else {
-                    println!(
-                        "done! {} samples, median/error: {:.2}/{:.4} (from {:?})",
-                        rev.n_measurements(),
-                        rev.median.unwrap(),
-                        rev.rel_error.unwrap(),
-                        old_relative_error,
-                    );
-                    false
+            rev.benchmark(file_idx)?;
+            let fr = &mut rev.file_results[file_idx];
+            let old_relative_error = fr.rel_error;
+
+            if let Err(InsufficientSamples(_)) = fr.compute_median(&mut mi) {
+                println!("done!");
+            } else {
+                print!(
+                    "done! {} samples, median {:.2}",
+                    fr.n_measurements(),
+                    fr.median.unwrap()
+                );
+                match old_relative_error {
+                    None => print!(", error {:.4}", fr.rel_error.unwrap()),
+                    Some(old) => print!(", error {:.4} => {:.4}", old, fr.rel_error.unwrap()),
                 }
-            };
-            if done_with_revision {
-                let mut rev = unfinished_revisions.swap_remove(idx);
-                rev.measurement_file.close();
-                finished_revisions.push(rev);
+                if is_file_result_finished(fr, args.min_measurements, args.rel_error) {
+                    println!(" is *GOOD ENOUGH*");
+                } else {
+                    println!();
+                }
+                fr.close();
             }
         }
-        finished_revisions.sort_by(|a, b| a.ordinal.partial_cmp(&b.ordinal).unwrap());
-        print_results(&finished_revisions, &args);
+
+        // Sort by ordinal for display
+        revisions.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
+
+        if is_multi_file {
+            print_results_multifile(&revisions, &mut mi);
+        } else {
+            print_results_single(&revisions, &args);
+        }
         Ok(())
     })();
 
     result
 }
 
-fn print_results(results: &[Revision], args: &Args) {
+fn print_results_single(results: &[Revision], args: &Args) {
+    let file_name = args.jxl_file.as_deref().unwrap_or("unknown");
     println!("\n{}", "=".repeat(80));
-    println!("BENCHMARK RESULTS using {}", args.jxl_file);
+    println!("BENCHMARK RESULTS using {}", file_name);
     println!("{}", "=".repeat(80));
 
-    // Calculate statistics
+    // Calculate statistics (using first file result from each revision)
     let mut min = f64::MAX;
     let mut max = f64::MIN;
     let mut sum = 0f64;
     for rev in results.iter() {
-        let m = rev.median.unwrap();
+        let m = rev.file_results[0].median.unwrap();
         min = min.min(m);
         max = max.max(m);
         sum += m;
@@ -532,8 +652,9 @@ fn print_results(results: &[Revision], args: &Args) {
     let mut graph_min = min;
     let mut graph_max = max;
     for result in results.iter() {
-        let median = result.median.unwrap();
-        let half_width = result.rel_error.unwrap() * median;
+        let fr = &result.file_results[0];
+        let median = fr.median.unwrap();
+        let half_width = fr.rel_error.unwrap() * median;
         graph_min = graph_min.min(median - half_width);
         graph_max = graph_max.max(median + half_width);
     }
@@ -542,8 +663,9 @@ fn print_results(results: &[Revision], args: &Args) {
     const BAR_WIDTH: usize = 60;
 
     for (i, result) in results.iter().enumerate() {
-        let median = result.median.unwrap();
-        let half_width = result.rel_error.unwrap() * median;
+        let fr = &result.file_results[0];
+        let median = fr.median.unwrap();
+        let half_width = fr.rel_error.unwrap() * median;
         let ci_lower = median - half_width;
         let ci_upper = median + half_width;
 
@@ -586,4 +708,193 @@ fn print_results(results: &[Revision], args: &Args) {
 
     println!("{}", "-".repeat(150));
     println!("Scale: {:.0} to {:.0} pixels/s", graph_min, graph_max);
+}
+
+/// Compute ratio statistics between two sets of measurements using the same
+/// order statistics approach as for individual medians.
+fn compute_ratio_stats(
+    current_measurements: &[f64],
+    prev_median: f64,
+    mi: &mut MedianIndices,
+) -> Option<(f64, f64, f64)> {
+    // Compute ratios: each measurement divided by previous median
+    let ratios: Vec<f64> = current_measurements
+        .iter()
+        .map(|&m| m / prev_median)
+        .collect();
+
+    let n = ratios.len();
+    if n < 3 {
+        return None;
+    }
+
+    let mut sorted = ratios.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let median = if n.is_multiple_of(2) {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    } else {
+        sorted[n / 2]
+    };
+
+    let (lo, hi, _) = mi.get(n);
+    let ci_lower = sorted[lo];
+    let ci_upper = sorted[hi];
+
+    Some((median, ci_lower, ci_upper))
+}
+
+fn print_results_multifile(results: &[Revision], mi: &mut MedianIndices) {
+    println!("\n{}", "=".repeat(100));
+    println!(
+        "MULTI-FILE BENCHMARK RESULTS ({} files, {} revisions)",
+        results[0].file_results.len(),
+        results.len()
+    );
+    println!("{}", "=".repeat(100));
+
+    // Skip the first (oldest) revision - nothing to compare to
+    if results.len() < 2 {
+        println!("Need at least 2 revisions to show comparisons.");
+        return;
+    }
+
+    const BAR_WIDTH: usize = 40;
+
+    // For each revision (except oldest), show comparison to previous
+    for i in 0..(results.len() - 1) {
+        let current_rev = &results[i];
+        let prev_rev = &results[i + 1]; // +1 because sorted by ordinal (newest first)
+
+        println!(
+            "\n[{:2}] {:.8} {}",
+            i + 1,
+            current_rev.oid,
+            current_rev.clipped_summary(60)
+        );
+        println!(
+            "     vs {:.8} {}",
+            prev_rev.oid,
+            prev_rev.clipped_summary(60)
+        );
+        println!("{}", "-".repeat(100));
+
+        // Collect ratio stats for all files to determine scale
+        let mut all_ratios: Vec<(String, f64, f64, f64)> = vec![];
+
+        for (file_idx, current_fr) in current_rev.file_results.iter().enumerate() {
+            let prev_fr = &prev_rev.file_results[file_idx];
+
+            if let (Some(prev_median), Some(_)) = (prev_fr.median, current_fr.median)
+                && let Some((ratio, ci_lo, ci_hi)) =
+                    compute_ratio_stats(&current_fr.measurement_file.measurements, prev_median, mi)
+            {
+                let file_name = Path::new(&current_fr.file_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                all_ratios.push((file_name, ratio, ci_lo, ci_hi));
+            }
+        }
+
+        if all_ratios.is_empty() {
+            println!("     No valid comparisons available");
+            continue;
+        }
+
+        // Determine scale: center at 1.0, expand to fit all CIs
+        let mut scale_min = 1.0f64;
+        let mut scale_max = 1.0f64;
+        for (_, _, ci_lo, ci_hi) in &all_ratios {
+            scale_min = scale_min.min(*ci_lo);
+            scale_max = scale_max.max(*ci_hi);
+        }
+        // Ensure symmetric around 1.0 and reasonable range
+        let max_deviation = (1.0 - scale_min).max(scale_max - 1.0).max(0.1);
+        scale_min = 1.0 - max_deviation * 1.1;
+        scale_max = 1.0 + max_deviation * 1.1;
+        let scale_range = scale_max - scale_min;
+
+        // Position of 1.0 (baseline) in the bar
+        let baseline_pos = ((1.0 - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
+
+        // Find max file name length for alignment
+        let max_name_len = all_ratios
+            .iter()
+            .map(|(name, _, _, _)| name.len())
+            .max()
+            .unwrap_or(10)
+            .min(30);
+
+        for (file_name, ratio, ci_lo, ci_hi) in &all_ratios {
+            let pos_lo = ((ci_lo - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
+            let pos_median = ((ratio - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
+            let pos_hi = ((ci_hi - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
+
+            // Build the bar
+            let mut bar = vec![' '; BAR_WIDTH];
+
+            // Draw baseline marker
+            if baseline_pos < BAR_WIDTH {
+                bar[baseline_pos] = '┃';
+            }
+
+            // Draw CI bar (overwriting baseline if overlapping)
+            let lo = pos_lo.min(BAR_WIDTH - 1);
+            let hi = pos_hi.min(BAR_WIDTH - 1);
+            let med = pos_median.min(BAR_WIDTH - 1);
+
+            bar[lo] = '├';
+            bar[hi] = '┤';
+            for c in bar.iter_mut().take(med).skip(lo + 1) {
+                if *c == '┃' {
+                    *c = '╂'; // CI crosses baseline
+                } else {
+                    *c = '─';
+                }
+            }
+            bar[med] = '│';
+            for c in bar.iter_mut().take(hi).skip(med + 1) {
+                if *c == '┃' {
+                    *c = '╂';
+                } else {
+                    *c = '─';
+                }
+            }
+
+            let bar_str: String = bar.into_iter().collect();
+
+            // Truncate or pad file name
+            let display_name = if file_name.len() > max_name_len {
+                format!("{}...", &file_name[..(max_name_len - 3)])
+            } else {
+                format!("{:width$}", file_name, width = max_name_len)
+            };
+
+            // Indicator for significant change
+            let indicator = if *ci_lo > 1.0 {
+                format!("▲ faster ({:.2} / prev)", ratio)
+            } else if *ci_hi < 1.0 {
+                format!("▼ slower ({:.2} / prev)", ratio)
+            } else {
+                String::new()
+            };
+
+            println!(
+                "     {} | {} | {:.3} / prev {}",
+                display_name, bar_str, ratio, indicator
+            );
+        }
+
+        println!(
+            "     {:width$}   Scale: {:.2} to {:.2} (1.0 = same speed)",
+            "",
+            scale_min,
+            scale_max,
+            width = max_name_len
+        );
+    }
+
+    println!("\n{}", "=".repeat(100));
 }
