@@ -1072,21 +1072,29 @@ fn print_results_single(results: &[Revision], args: &Args, noise_metrics: &Noise
 
         let bar_str = draw_ci_bar(pos_lower, pos_median, pos_upper, BAR_WIDTH, None);
 
+        // Compute ratio vs previous revision (next in array since sorted newest-first)
+        let ratio_str = if i < results.len() - 1 {
+            let prev_median = results[i + 1].file_results[0].median.unwrap();
+            format!("{:.2} / prev", median / prev_median)
+        } else {
+            String::new()
+        };
+
         let marker = if median == max {
-            format!("▲ MAX ({:.2} / min)", max / min)
+            format!("^ MAX ({:.2} / min)", max / min)
         } else if median == min {
-            format!("▼ MIN ({:.2} / max)", min / max)
+            format!("v MIN ({:.2} / max)", min / max)
         } else {
             "".to_string()
         };
 
         println!(
-            "[{:2}] {:.8} {:<50} | {:60} | {:.2} {}",
+            "[{:2}] {:.8} {:<50} | {:60} | {:>13} {}",
             i + 1,
             result.oid,
             result.clipped_summary(50),
             bar_str,
-            median,
+            ratio_str,
             marker
         );
     }
@@ -1240,9 +1248,9 @@ fn print_results_multifile(
 
             // Indicator for significant change
             let indicator = if *ci_lo > 1.0 {
-                format!("▲ faster ({:.2} / prev)", ratio)
+                format!("^ faster ({:.2} / prev)", ratio)
             } else if *ci_hi < 1.0 {
-                format!("▼ slower ({:.2} / prev)", ratio)
+                format!("v slower ({:.2} / prev)", ratio)
             } else {
                 String::new()
             };
