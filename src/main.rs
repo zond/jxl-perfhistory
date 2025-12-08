@@ -41,9 +41,13 @@ fn unregister_cleanup(id: usize) {
 fn setup_ctrlc_handler() {
     ctrlc::set_handler(move || {
         eprintln!("\nInterrupted, cleaning up...");
-        let mut registry = CLEANUP_REGISTRY.lock().unwrap();
-        for cleanup_fn in registry.iter_mut().flatten() {
-            cleanup_fn();
+        // Use try_lock to avoid panic if mutex is poisoned or held by another thread
+        if let Ok(mut registry) = CLEANUP_REGISTRY.try_lock() {
+            for cleanup_fn in registry.iter_mut().flatten() {
+                cleanup_fn();
+            }
+        } else {
+            eprintln!("Warning: Could not acquire cleanup lock, some cleanup may be skipped");
         }
         std::process::exit(130); // Standard exit code for Ctrl-C
     })
@@ -359,9 +363,12 @@ impl MeasurementFile {
                 ));
             }
 
-            // SAFETY: The file contains only f64 values written by append().
-            // f64 has no alignment requirements beyond 8 bytes.
-            // The mmap is read-only and we copy the data out before it's dropped.
+            // SAFETY:
+            // - File size is validated to be a multiple of 8 bytes (lines 354-363)
+            // - The file contains only f64 values written by append() in native endian
+            // - f64 has natural alignment of 8 bytes, satisfied by mmap page alignment
+            // - We use a read-only mmap and immediately copy data to Vec, avoiding TOCTOU
+            // - Endianness is consistent: we write and read using native endian
             let mmap = unsafe { Mmap::map(&file)? };
             let bytes: &[f64] = bytemuck::cast_slice(&mmap);
             bytes.to_vec()
@@ -376,7 +383,7 @@ impl MeasurementFile {
     /// Append a measurement to both the file and the in-memory vector.
     fn append(&mut self, value: f64) -> Result<()> {
         if let Some(ref mut file) = self.file {
-            file.write_all(&value.to_le_bytes())?;
+            file.write_all(&value.to_ne_bytes())?;
             file.flush()?;
         }
         self.measurements.push(value);
@@ -847,18 +854,28 @@ fn main() -> Result<()> {
         }
     }
 
-    // Report already-finished revisions
+    // Report status of loaded data
     for rev in &revisions {
-        if is_revision_finished(rev, args.min_measurements, args.rel_error) {
-            let fr = &rev.file_results[0];
-            eprintln!(
-                "{:.8}: {:<50} is already done, {} samples, median/error: {:.2}/{:.4}",
-                rev.oid,
-                rev.clipped_summary(50),
-                fr.n_measurements(),
-                fr.median.unwrap(),
-                fr.rel_error.unwrap()
-            );
+        let fr = &rev.file_results[0];
+        let n = fr.n_measurements();
+        if n > 0 {
+            if is_revision_finished(rev, args.min_measurements, args.rel_error) {
+                eprintln!(
+                    "{:.8}: {:<50} is already done, {} samples, median/error: {:.2}/{:.4}",
+                    rev.oid,
+                    rev.clipped_summary(50),
+                    n,
+                    fr.median.unwrap(),
+                    fr.rel_error.unwrap()
+                );
+            } else {
+                eprintln!(
+                    "{:.8}: {:<50} loaded {} cached samples (needs more)",
+                    rev.oid,
+                    rev.clipped_summary(50),
+                    n
+                );
+            }
         }
     }
 
@@ -930,10 +947,10 @@ fn main() -> Result<()> {
             }
             if is_file_result_finished(fr, args.min_measurements, args.rel_error) {
                 eprintln!(" is *GOOD ENOUGH*");
+                fr.close();
             } else {
                 eprintln!();
             }
-            fr.close();
         }
     }
 
@@ -946,7 +963,7 @@ fn main() -> Result<()> {
     if is_multi_file {
         print_results_multifile(&revisions, &mut mi, &args, &noise_metrics);
     } else {
-        print_results_single(&revisions, &args, &noise_metrics);
+        print_results_single(&revisions, &mut mi, &args, &noise_metrics);
     }
 
     Ok(())
@@ -963,7 +980,7 @@ fn print_header(title: &str, noise_metrics: &NoiseMetrics, width: usize) {
     println!("{}", "=".repeat(width));
 }
 
-/// Draw a CI bar: [---|---]
+/// Draw a CI bar: ├───│───┤
 /// Returns the bar as a string
 fn draw_ci_bar(
     pos_lower: usize,
@@ -978,36 +995,41 @@ fn draw_ci_bar(
     if let Some(bp) = baseline_pos
         && bp < bar_width
     {
-        bar[bp] = '!';
+        bar[bp] = '┃';
     }
 
     let lo = pos_lower.min(bar_width - 1);
     let hi = pos_upper.min(bar_width - 1);
     let med = pos_median.min(bar_width - 1);
 
-    bar[lo] = '[';
-    bar[hi] = ']';
+    bar[lo] = '├';
+    bar[hi] = '┤';
 
     for c in bar.iter_mut().take(med).skip(lo + 1) {
-        if *c == '!' {
-            *c = '+'; // CI crosses baseline
+        if *c == '┃' {
+            *c = '╂'; // CI crosses baseline
         } else {
-            *c = '-';
+            *c = '─';
         }
     }
-    bar[med] = '|';
+    bar[med] = '│';
     for c in bar.iter_mut().take(hi).skip(med + 1) {
-        if *c == '!' {
-            *c = '+';
+        if *c == '┃' {
+            *c = '╂';
         } else {
-            *c = '-';
+            *c = '─';
         }
     }
 
     bar.into_iter().collect()
 }
 
-fn print_results_single(results: &[Revision], args: &Args, noise_metrics: &NoiseMetrics) {
+fn print_results_single(
+    results: &[Revision],
+    mi: &mut MedianIndices,
+    args: &Args,
+    noise_metrics: &NoiseMetrics,
+) {
     let file_name = args.jxl_file.as_deref().unwrap_or("unknown");
     print_header(
         &format!("BENCHMARK RESULTS using {}", file_name),
@@ -1039,68 +1061,97 @@ fn print_results_single(results: &[Revision], args: &Args, noise_metrics: &Noise
         ((max - min) / min) * 100.0
     );
 
-    // Show performance graph with credible intervals
-    println!("\n{}", "=".repeat(80));
-    println!("Performance Graph (with credible intervals):");
-    println!("{}", "-".repeat(150));
+    // Show performance graph with absolute pixels/s credible intervals
+    println!("\n{}", "=".repeat(160));
+    println!("Performance Graph (absolute pixels/s, with credible intervals):");
+    println!("{}", "-".repeat(160));
 
-    // Find the full range including all CI bounds
-    let mut graph_min = min;
-    let mut graph_max = max;
+    const BAR_WIDTH: usize = 80;
+
+    // Helper to compute CI bounds from measurements
+    let compute_ci = |measurements: &[f64], mi: &mut MedianIndices| -> Option<(f64, f64, f64)> {
+        let n = measurements.len();
+        if n < 3 {
+            return None;
+        }
+        let mut sorted = measurements.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if n.is_multiple_of(2) {
+            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+        } else {
+            sorted[n / 2]
+        };
+        let (lo, hi, _) = mi.get(n);
+        Some((sorted[lo], median, sorted[hi]))
+    };
+
+    // Determine scale from absolute performance values
+    let mut scale_min = f64::MAX;
+    let mut scale_max = f64::MIN;
     for result in results.iter() {
         let fr = &result.file_results[0];
-        let median = fr.median.unwrap();
-        let half_width = fr.rel_error.unwrap() * median;
-        graph_min = graph_min.min(median - half_width);
-        graph_max = graph_max.max(median + half_width);
+        if let Some((ci_lo, _, ci_hi)) = compute_ci(&fr.measurement_file.measurements, mi) {
+            scale_min = scale_min.min(ci_lo);
+            scale_max = scale_max.max(ci_hi);
+        }
     }
-    let graph_range = graph_max - graph_min;
+    // Add some padding
+    let range = scale_max - scale_min;
+    scale_min -= range * 0.05;
+    scale_max += range * 0.05;
+    let scale_range = scale_max - scale_min;
 
-    const BAR_WIDTH: usize = 60;
+    // Precompute ratios for display
+    let mut ratios: Vec<Option<f64>> = vec![None; results.len()];
+    for i in 0..(results.len() - 1) {
+        let current_median = results[i].file_results[0].median.unwrap();
+        let prev_median = results[i + 1].file_results[0].median.unwrap();
+        ratios[i] = Some(current_median / prev_median);
+    }
 
     for (i, result) in results.iter().enumerate() {
         let fr = &result.file_results[0];
         let median = fr.median.unwrap();
-        let half_width = fr.rel_error.unwrap() * median;
-        let ci_lower = median - half_width;
-        let ci_upper = median + half_width;
 
-        // Normalize positions to bar width
-        let pos_lower = ((ci_lower - graph_min) / graph_range * (BAR_WIDTH - 1) as f64) as usize;
-        let pos_median = ((median - graph_min) / graph_range * (BAR_WIDTH - 1) as f64) as usize;
-        let pos_upper = ((ci_upper - graph_min) / graph_range * (BAR_WIDTH - 1) as f64) as usize;
-
-        let bar_str = draw_ci_bar(pos_lower, pos_median, pos_upper, BAR_WIDTH, None);
-
-        // Compute ratio vs previous revision (next in array since sorted newest-first)
-        let ratio_str = if i < results.len() - 1 {
-            let prev_median = results[i + 1].file_results[0].median.unwrap();
-            format!("{:.2} / prev", median / prev_median)
+        let marker = if median == max {
+            format!("▲ MAX ({:.2} / min)", max / min)
+        } else if median == min {
+            format!("▼ MIN ({:.2} / max)", min / max)
         } else {
             String::new()
         };
 
-        let marker = if median == max {
-            format!("^ MAX ({:.2} / min)", max / min)
-        } else if median == min {
-            format!("v MIN ({:.2} / max)", min / max)
+        let bar_str = if let Some((ci_lo, _, ci_hi)) =
+            compute_ci(&fr.measurement_file.measurements, mi)
+        {
+            let pos_lo = ((ci_lo - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
+            let pos_median = ((median - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
+            let pos_hi = ((ci_hi - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
+            draw_ci_bar(pos_lo, pos_median, pos_hi, BAR_WIDTH, None)
         } else {
-            "".to_string()
+            " ".repeat(BAR_WIDTH)
+        };
+
+        let ratio_str = if let Some(ratio) = ratios[i] {
+            format!("{:.2} / prev", ratio)
+        } else {
+            String::new()
         };
 
         println!(
-            "[{:2}] {:.8} {:<50} | {:60} | {:>13} {}",
+            "[{:2}] {:.8} {:<40} | {:80} | {:>12.0} px/s | {:12} {}",
             i + 1,
             result.oid,
-            result.clipped_summary(50),
+            result.clipped_summary(40),
             bar_str,
+            median,
             ratio_str,
             marker
         );
     }
 
-    println!("{}", "-".repeat(150));
-    println!("Scale: {:.0} to {:.0} pixels/s", graph_min, graph_max);
+    println!("{}", "-".repeat(160));
+    println!("Scale: {:.0} to {:.0} pixels/s", scale_min, scale_max);
 }
 
 /// Compute ratio statistics between two sets of measurements using the same
@@ -1164,7 +1215,7 @@ fn print_results_multifile(
         return;
     }
 
-    const BAR_WIDTH: usize = 40;
+    const BAR_WIDTH: usize = 80;
 
     // For each revision (except oldest), show comparison to previous
     for i in 0..(results.len() - 1) {
@@ -1182,15 +1233,16 @@ fn print_results_multifile(
             prev_rev.oid,
             prev_rev.clipped_summary(60)
         );
-        println!("{}", "-".repeat(100));
+        println!("{}", "-".repeat(160));
 
         // Collect ratio stats for all files to determine scale
-        let mut all_ratios: Vec<(String, f64, f64, f64)> = vec![];
+        // Tuple: (file_name, ratio, ci_lo, ci_hi, current_median)
+        let mut all_ratios: Vec<(String, f64, f64, f64, f64)> = vec![];
 
         for (file_idx, current_fr) in current_rev.file_results.iter().enumerate() {
             let prev_fr = &prev_rev.file_results[file_idx];
 
-            if let (Some(prev_median), Some(_)) = (prev_fr.median, current_fr.median)
+            if let (Some(prev_median), Some(current_median)) = (prev_fr.median, current_fr.median)
                 && let Some((ratio, ci_lo, ci_hi)) =
                     compute_ratio_stats(&current_fr.measurement_file.measurements, prev_median, mi)
             {
@@ -1199,7 +1251,7 @@ fn print_results_multifile(
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                all_ratios.push((file_name, ratio, ci_lo, ci_hi));
+                all_ratios.push((file_name, ratio, ci_lo, ci_hi, current_median));
             }
         }
 
@@ -1211,7 +1263,7 @@ fn print_results_multifile(
         // Determine scale: center at 1.0, expand to fit all CIs
         let mut scale_min = 1.0f64;
         let mut scale_max = 1.0f64;
-        for (_, _, ci_lo, ci_hi) in &all_ratios {
+        for (_, _, ci_lo, ci_hi, _) in &all_ratios {
             scale_min = scale_min.min(*ci_lo);
             scale_max = scale_max.max(*ci_hi);
         }
@@ -1227,12 +1279,12 @@ fn print_results_multifile(
         // Find max file name length for alignment
         let max_name_len = all_ratios
             .iter()
-            .map(|(name, _, _, _)| name.len())
+            .map(|(name, _, _, _, _)| name.len())
             .max()
             .unwrap_or(10)
             .min(30);
 
-        for (file_name, ratio, ci_lo, ci_hi) in &all_ratios {
+        for (file_name, ratio, ci_lo, ci_hi, median) in &all_ratios {
             let pos_lo = ((ci_lo - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
             let pos_median = ((ratio - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
             let pos_hi = ((ci_hi - scale_min) / scale_range * (BAR_WIDTH - 1) as f64) as usize;
@@ -1248,21 +1300,21 @@ fn print_results_multifile(
 
             // Indicator for significant change
             let indicator = if *ci_lo > 1.0 {
-                format!("^ faster ({:.2} / prev)", ratio)
+                format!("▲ faster ({:.2} / prev)", ratio)
             } else if *ci_hi < 1.0 {
-                format!("v slower ({:.2} / prev)", ratio)
+                format!("▼ slower ({:.2} / prev)", ratio)
             } else {
                 String::new()
             };
 
             println!(
-                "     {} | {} | {:.3} / prev {}",
-                display_name, bar_str, ratio, indicator
+                "     {} | {} | {:>12.0} px/s | {:.3} / prev {}",
+                display_name, bar_str, median, ratio, indicator
             );
         }
 
         println!(
-            "     {:width$}   Scale: {:.2} to {:.2} (1.0 = same speed, '+' marks 1.0)",
+            "     {:width$}   Scale: {:.2} to {:.2} (1.0 = same speed, '┃' marks 1.0)",
             "",
             scale_min,
             scale_max,
@@ -1279,5 +1331,5 @@ fn print_results_multifile(
         oldest_rev.clipped_summary(60)
     );
 
-    println!("\n{}", "=".repeat(100));
+    println!("\n{}", "=".repeat(160));
 }
