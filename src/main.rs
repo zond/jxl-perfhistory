@@ -16,26 +16,28 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::result;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 use tempfile::TempDir;
 use thiserror::Error;
 
-/// Global registry of cleanup functions for Ctrl-C handler
+/// Global registry of cleanup functions for Ctrl-C handler.
+/// Uses HashMap with atomic counter to avoid unbounded growth and ensure proper cleanup.
 type CleanupFn = Box<dyn FnMut() + Send>;
-static CLEANUP_REGISTRY: Mutex<Vec<Option<CleanupFn>>> = Mutex::new(Vec::new());
+static CLEANUP_REGISTRY: LazyLock<Mutex<HashMap<usize, CleanupFn>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CLEANUP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn register_cleanup(f: CleanupFn) -> usize {
+    let id = CLEANUP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut registry = CLEANUP_REGISTRY.lock().unwrap();
-    let id = registry.len();
-    registry.push(Some(f));
+    registry.insert(id, f);
     id
 }
 
 fn unregister_cleanup(id: usize) {
     let mut registry = CLEANUP_REGISTRY.lock().unwrap();
-    if id < registry.len() {
-        registry[id] = None;
-    }
+    registry.remove(&id);
 }
 
 fn setup_ctrlc_handler() {
@@ -43,7 +45,7 @@ fn setup_ctrlc_handler() {
         eprintln!("\nInterrupted, cleaning up...");
         // Use try_lock to avoid panic if mutex is poisoned or held by another thread
         if let Ok(mut registry) = CLEANUP_REGISTRY.try_lock() {
-            for cleanup_fn in registry.iter_mut().flatten() {
+            for cleanup_fn in registry.values_mut() {
                 cleanup_fn();
             }
         } else {
@@ -52,6 +54,20 @@ fn setup_ctrlc_handler() {
         std::process::exit(130); // Standard exit code for Ctrl-C
     })
     .expect("Error setting Ctrl-C handler");
+}
+
+/// Safe comparison for f64 values that handles NaN gracefully.
+/// NaN values are treated as greater than all other values.
+fn f64_cmp(a: &f64, b: &f64) -> std::cmp::Ordering {
+    a.partial_cmp(b).unwrap_or_else(|| {
+        // Handle NaN: treat NaN as greater than everything
+        match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => unreachable!(), // partial_cmp only fails for NaN
+        }
+    })
 }
 
 #[derive(Parser, Debug)]
@@ -159,9 +175,13 @@ impl NoiseMetrics {
         }
 
         // Compute CV = stddev / mean
-        let n = measurements.len() as f64;
-        let mean = measurements.iter().sum::<f64>() / n;
-        let variance = measurements.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let n = measurements.len();
+        if n < 2 {
+            return 0.0; // Can't compute variance with fewer than 2 samples
+        }
+        let n_f = n as f64;
+        let mean = measurements.iter().sum::<f64>() / n_f;
+        let variance = measurements.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n_f - 1.0);
         let stddev = variance.sqrt();
         stddev / mean
     }
@@ -200,6 +220,23 @@ impl NoiseMetrics {
     }
 }
 
+/// Validate that a process name contains only safe characters
+fn validate_process_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(eyre!("Process name cannot be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(eyre!(
+            "Invalid process name '{}': only alphanumeric, '_', '-', and '.' allowed",
+            name
+        ));
+    }
+    Ok(())
+}
+
 /// Unpause processes by sending SIGCONT
 fn unpause_processes(processes: &[String]) {
     if processes.is_empty() {
@@ -227,6 +264,11 @@ struct ProcessPauser {
 
 impl ProcessPauser {
     fn new(processes: Vec<String>) -> Result<Self> {
+        // Validate all process names before doing anything
+        for name in &processes {
+            validate_process_name(name)?;
+        }
+
         if !processes.is_empty() {
             eprintln!("Pausing processes: {}", processes.join(", "));
             for name in &processes {
@@ -279,7 +321,11 @@ impl Drop for ProcessPauser {
     }
 }
 
-/// RAII guard to ensure git repo is restored to original branch even on panic/error
+/// RAII guard to ensure git repo is restored to original branch even on panic/error.
+///
+/// Note: There's a small race window where if Ctrl-C fires during restore(), both the
+/// explicit restore and the cleanup handler might run. This is harmless since restoring
+/// to the same commit is idempotent.
 struct RepoGuard {
     original_ref_name: Option<String>,
     cleanup_id: Option<usize>,
@@ -301,16 +347,17 @@ impl RepoGuard {
         }
     }
 
-    /// Explicitly restore the repo to the original branch
+    /// Explicitly restore the repo to the original branch.
+    /// Unregisters from cleanup registry to prevent double-restore on Ctrl-C.
     fn restore(&mut self) -> Result<()> {
+        // Unregister from cleanup registry FIRST to minimize race window
+        if let Some(id) = self.cleanup_id.take() {
+            unregister_cleanup(id);
+        }
         if let Some(ref original_ref_name) = self.original_ref_name {
             let repo = Repository::open(".")?;
             restore_repo(&repo, original_ref_name.clone())?;
             self.original_ref_name = None;
-        }
-        // Unregister from cleanup registry
-        if let Some(id) = self.cleanup_id.take() {
-            unregister_cleanup(id);
         }
         Ok(())
     }
@@ -371,6 +418,27 @@ impl MeasurementFile {
             // - Endianness is consistent: we write and read using native endian
             let mmap = unsafe { Mmap::map(&file)? };
             let bytes: &[f64] = bytemuck::cast_slice(&mmap);
+
+            // Validate loaded measurements
+            for (i, &val) in bytes.iter().enumerate() {
+                if !val.is_finite() {
+                    return Err(eyre!(
+                        "Invalid measurement at index {} in {}: {} (expected finite number)",
+                        i,
+                        path.display(),
+                        val
+                    ));
+                }
+                if val <= 0.0 {
+                    return Err(eyre!(
+                        "Invalid measurement at index {} in {}: {} (expected positive number)",
+                        i,
+                        path.display(),
+                        val
+                    ));
+                }
+            }
+
             bytes.to_vec()
         };
 
@@ -390,8 +458,11 @@ impl MeasurementFile {
         Ok(())
     }
 
-    /// Close the file handle explicitly.
+    /// Close the file handle explicitly, flushing any pending data.
     fn close(&mut self) {
+        if let Some(ref mut file) = self.file {
+            let _ = file.flush(); // Best effort flush before closing
+        }
         self.file = None;
     }
 }
@@ -423,10 +494,16 @@ impl MedianIndices {
         }
         // Build row n of Pascal's triangle: coeffs[k] = C(n, k)
         // Using the recurrence: C(n, k) = C(n, k-1) * (n - k + 1) / k
+        // Note: u128 can handle binomial coefficients up to about n=130 without overflow
         let mut coeffs = vec![0u128; n + 1];
         coeffs[0] = 1;
         for k in 1..=n {
-            coeffs[k] = coeffs[k - 1] * (n - k + 1) as u128 / k as u128;
+            // Use saturating arithmetic to avoid overflow panic in release mode
+            // If overflow occurs, coefficients will saturate at u128::MAX, giving
+            // conservative (wider) confidence intervals
+            coeffs[k] = coeffs[k - 1]
+                .saturating_mul((n - k + 1) as u128)
+                .saturating_div(k as u128);
         }
 
         // Total is 2^n (sum of all binomial coefficients)
@@ -512,7 +589,7 @@ impl FileResult {
         }
 
         let mut sorted = measurements.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(f64_cmp);
 
         let median = if n.is_multiple_of(2) {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
@@ -740,10 +817,10 @@ fn verify_repo(repo: &Repository) -> Result<String> {
 }
 
 fn restore_repo(repo: &Repository, original_ref: String) -> Result<()> {
-    // Check if it's a commit hash (40 hex chars) or a branch ref
-    if original_ref.len() == 40 && original_ref.chars().all(|c| c.is_ascii_hexdigit()) {
+    // Try parsing as OID first (handles SHA-1, SHA-256, and short hashes)
+    // If that fails, treat it as a branch ref
+    if let Ok(oid) = Oid::from_str(&original_ref) {
         // Detached HEAD - restore to specific commit
-        let oid = Oid::from_str(&original_ref)?;
         repo.set_head_detached(oid)?;
     } else {
         // Branch ref
@@ -1075,7 +1152,7 @@ fn print_results_single(
             return None;
         }
         let mut sorted = measurements.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(f64_cmp);
         let median = if n.is_multiple_of(2) {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
@@ -1173,7 +1250,7 @@ fn compute_ratio_stats(
     }
 
     let mut sorted = ratios.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(f64_cmp);
 
     let median = if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
