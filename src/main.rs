@@ -1451,35 +1451,6 @@ fn get_github_repo_url(repo: &Repository) -> Option<String> {
     }
 }
 
-/// Format confidence interval as "median ± error"
-fn format_ci(median: f64, rel_error: f64) -> String {
-    let half_width = median * rel_error;
-    format!("{:.2} ± {:.2}", median, half_width)
-}
-
-/// Format performance ratio with significance indicator
-fn format_ratio_indicator(ratio: f64, ci_lower: f64, ci_upper: f64) -> String {
-    if ci_lower > 1.0 {
-        format!("🚀 **Faster** ({:.3}×)", ratio)
-    } else if ci_upper < 1.0 {
-        format!("🐌 **Slower** ({:.3}×)", ratio)
-    } else {
-        format!("Similar ({:.3}×)", ratio)
-    }
-}
-
-/// Create Unicode block bar for visual representation
-fn create_markdown_bar(value: f64, min: f64, max: f64, width: usize) -> String {
-    let range = max - min;
-    if range == 0.0 {
-        return "▰".repeat(width);
-    }
-    let filled = ((value - min) / range * width as f64) as usize;
-    let filled = filled.min(width);
-    let empty = width - filled;
-    format!("{}{}", "▰".repeat(filled), "░".repeat(empty))
-}
-
 /// Format file name with link to conformance repo and preview image
 fn format_file_with_preview(file_name: &str) -> String {
     // Extract base name without extension (e.g., "bike.jxl" -> "bike")
@@ -1500,221 +1471,183 @@ fn format_file_with_preview(file_name: &str) -> String {
 // Markdown Output Functions
 // ============================================================================
 
-fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metrics: &NoiseMetrics) {
-    let file_name = args.jxl_file.as_deref().unwrap_or("unknown");
+fn print_results_single_markdown(results: &[Revision], _args: &Args, noise_metrics: &NoiseMetrics) {
+    let file_name = _args.jxl_file.as_deref().unwrap_or("unknown");
 
     // Get GitHub repo URL for commit links
     let repo = Repository::open(".").ok();
     let github_url = repo.as_ref().and_then(get_github_repo_url);
-
-    // Header
-    println!("# 🚀 JPEG XL Performance Benchmark\n");
-
-    // Benchmark info table
-    let file_display = format_file_with_preview(file_name);
-    let repo_url = if let Some(ref url) = github_url {
-        url.clone()
-    } else {
-        "https://github.com/zond/jxl-perfhistory".to_string()
-    };
-
-    println!("| | |");
-    println!("|---|---|");
-    println!("| **File** | {} |", file_display);
-    println!("| **Repository** | {} |", repo_url);
-    println!("| **CPU Architecture** | {} |\n", std::env::consts::ARCH);
-    println!("---\n");
-
-    // Calculate statistics
-    let mut min = f64::MAX;
-    let mut max = f64::MIN;
-    let mut sum = 0f64;
-    for rev in results.iter() {
-        let m = rev.file_results[0].median.unwrap();
-        min = min.min(m);
-        max = max.max(m);
-        sum += m;
-    }
-    let avg = sum / results.len() as f64;
-    let improvement = ((max - min) / min) * 100.0;
-
-    // Summary Statistics
-    println!("## 📊 Summary Statistics\n");
-    println!("| Metric | Value |");
-    println!("|--------|-------|");
-    println!("| Revisions Tested | {} |", results.len());
-    println!("| Confidence Level | {:.1}% |", 100f64 * args.confidence);
-    println!("| Max Relative Error | {:.1}% |", 100f64 * args.rel_error);
-    println!("| Min Speed | {:.2} pixels/s |", min);
-    println!("| Max Speed | {:.2} pixels/s |", max);
-    println!("| Average Speed | {:.2} pixels/s |", avg);
-    println!("| **Total Improvement** | **{:.1}%** |\n", improvement);
-    println!("---\n");
-
-    // Performance Results Table
-    println!("## 📈 Performance Results\n");
-    println!("| # | Commit | Message | Performance | Speed (pixels/s) | Status |");
-    println!("|---|--------|---------|-------------|------------------|--------|");
-
-    const TABLE_BAR_WIDTH: usize = 20;
-    for (i, result) in results.iter().enumerate() {
-        let fr = &result.file_results[0];
-        let median = fr.median.unwrap();
-        let ci = format_ci(median, fr.rel_error.unwrap());
-        let summary = result.clipped_summary(40);
-
-        // Create visual bar
-        let bar = create_markdown_bar(median, min, max, TABLE_BAR_WIDTH);
-
-        let status = if median == max {
-            "🏆 MAX"
-        } else if median == min {
-            "🔻 MIN"
-        } else {
-            let ratio = median / max;
-            &format!("×{:.2}", ratio)
-        };
-
-        // Format commit as link if GitHub URL available
-        let commit_str = if let Some(ref url) = github_url {
-            format!("[{:.8}]({}/commit/{})", result.oid, url, result.oid)
-        } else {
-            format!("`{:.8}`", result.oid)
-        };
-
-        println!("| {} | {} | {} | {} | {} | {} |",
-                 i + 1, commit_str, summary, bar, ci, status);
-    }
-
-    println!();
-
-    // System warnings if present
-    if let Some(warning) = noise_metrics.warning_message() {
-        println!("## ⚠️ System Information\n");
-        println!("> **Note**: {}\n", warning);
-        println!("---\n");
-    }
-
-    println!("---");
-    println!("<sup>Generated by jxl-perfhistory</sup>");
-}
-
-fn print_results_multifile_markdown(
-    results: &[Revision],
-    mi: &mut MedianIndices,
-    args: &Args,
-    noise_metrics: &NoiseMetrics,
-) {
-    // Get GitHub repo URL for commit links
-    let repo = Repository::open(".").ok();
-    let github_url = repo.as_ref().and_then(get_github_repo_url);
-
-    // Header
-    println!("# 🎯 JPEG XL Multi-File Performance Benchmark\n");
-    println!("> **Files Tested**: {}", results[0].file_results.len());
-    println!("> **Revisions**: {}", results.len());
-    if let Some(ref url) = github_url {
-        println!("> **Repository**: {}\n", url);
-    } else {
-        println!("> **Repository**: https://github.com/zond/jxl-perfhistory\n");
-    }
-    println!("---\n");
-
-    // Configuration
-    println!("## 📊 Configuration\n");
-    println!("| Setting | Value |");
-    println!("|---------|-------|");
-    println!("| Confidence Level | {:.1}% |", 100f64 * args.confidence);
-    println!("| Max Relative Error | {:.1}% |", 100f64 * args.rel_error);
-    println!("| CPU Architecture | {} |\n", std::env::consts::ARCH);
-    println!("---\n");
-
-    // System warnings if present
-    if let Some(warning) = noise_metrics.warning_message() {
-        println!("> ⚠️ **System Note**: {}\n", warning);
-        println!("---\n");
-    }
 
     if results.len() < 2 {
         println!("Need at least 2 revisions to show comparisons.");
         return;
     }
 
-    println!("## 📈 Revision-by-Revision Analysis\n");
+    // HEAD (newest) vs main (oldest)
+    let head_rev = &results[0];
+    let main_rev = &results[results.len() - 1];
 
-    // For each revision (except oldest), show comparison to previous
-    for i in 0..(results.len() - 1) {
-        let current_rev = &results[i];
-        let prev_rev = &results[i + 1];
-
-        // Format commits as links if GitHub URL available
-        let current_commit = if let Some(ref url) = github_url {
-            format!("[{:.8}]({}/commit/{})", current_rev.oid, url, current_rev.oid)
-        } else {
-            format!("`{:.8}`", current_rev.oid)
-        };
-        let prev_commit = if let Some(ref url) = github_url {
-            format!("[{:.8}]({}/commit/{})", prev_rev.oid, url, prev_rev.oid)
-        } else {
-            format!("`{:.8}`", prev_rev.oid)
-        };
-
-        println!("### [{}] {} - {}", i + 1, current_commit, current_rev.clipped_summary(60));
-        println!("**vs** {} - {}\n", prev_commit, prev_rev.clipped_summary(60));
-
-        // Collect ratio stats for all files
-        let mut all_ratios: Vec<(String, f64, f64, f64)> = vec![];
-
-        for (file_idx, current_fr) in current_rev.file_results.iter().enumerate() {
-            let prev_fr = &prev_rev.file_results[file_idx];
-
-            if let (Some(prev_median), Some(_)) = (prev_fr.median, current_fr.median)
-                && let Some((ratio, ci_lo, ci_hi)) =
-                    compute_ratio_stats(&current_fr.measurement_file.measurements, prev_median, mi)
-            {
-                let file_name = Path::new(&current_fr.file_path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                all_ratios.push((file_name, ratio, ci_lo, ci_hi));
-            }
-        }
-
-        if all_ratios.is_empty() {
-            println!("No valid comparisons available\n");
-            println!("---\n");
-            continue;
-        }
-
-        // Print table
-        println!("| File | Ratio vs Prev | CI Range | Assessment |");
-        println!("|------|---------------|----------|------------|");
-
-        for (file_name, ratio, ci_lo, ci_hi) in &all_ratios {
-            let assessment = format_ratio_indicator(*ratio, *ci_lo, *ci_hi);
-            let file_display = format_file_with_preview(file_name);
-            println!("| {} | {:.3} | [{:.3}, {:.3}] | {} |",
-                     file_display, ratio, ci_lo, ci_hi, assessment);
-        }
-
-        println!("\n---\n");
-    }
-
-    // Baseline reference
-    let oldest_rev = &results[results.len() - 1];
-    println!("## 📌 Baseline\n");
-
-    let oldest_commit = if let Some(ref url) = github_url {
-        format!("[{:.8}]({}/commit/{})", oldest_rev.oid, url, oldest_rev.oid)
+    // Format commits as links
+    let head_commit = if let Some(ref url) = github_url {
+        format!("[{:.8}]({}/commit/{})", head_rev.oid, url, head_rev.oid)
     } else {
-        format!("`{:.8}`", oldest_rev.oid)
+        format!("`{:.8}`", head_rev.oid)
+    };
+    let main_commit = if let Some(ref url) = github_url {
+        format!("[{:.8}]({}/commit/{})", main_rev.oid, url, main_rev.oid)
+    } else {
+        format!("`{:.8}`", main_rev.oid)
     };
 
-    println!("**[{}]** {} - {} (oldest revision)\n",
-             results.len(), oldest_commit, oldest_rev.clipped_summary(60));
+    let repo_url = if let Some(ref url) = github_url {
+        url.clone()
+    } else {
+        "https://github.com/libjxl/jxl-rs".to_string()
+    };
+
+    // Header
+    println!("# 🚀 JPEG XL Performance Benchmark\n");
+
+    // Benchmark info table
+    let file_display = format_file_with_preview(file_name);
+
+    println!("| | |");
+    println!("|---|---|");
+    println!("| **File** | {} |", file_display);
+    println!("| **Comparing** | {} vs {} (main) |", head_commit, main_commit);
+    println!("| **Repository** | {} |", repo_url);
+    println!("| **CPU Architecture** | {} |", std::env::consts::ARCH);
+
+    // System warnings if present
+    if let Some(warning) = noise_metrics.warning_message() {
+        println!("| **Warning** | ⚠️ {} |", warning);
+    }
+
+    println!();
     println!("---\n");
 
+    // Get main and head speeds
+    let main_median = main_rev.file_results[0].median.unwrap();
+    let head_median = head_rev.file_results[0].median.unwrap();
+
+    // Convert to MP/s
+    let main_mps = main_median / 1_000_000.0;
+    let head_mps = head_median / 1_000_000.0;
+
+    // Calculate percentage difference
+    let pct_diff = ((head_median - main_median) / main_median) * 100.0;
+
+    // Format diff with indicator
+    let diff_str = if pct_diff > 5.0 {
+        format!("**{:+.2}%** 🚀", pct_diff)
+    } else if pct_diff < -5.0 {
+        format!("**{:+.2}%** 🐌", pct_diff)
+    } else {
+        format!("{:+.2}%", pct_diff)
+    };
+
+    // Results table
+    println!("## 📊 Results\n");
+    println!("| Main (MP/s) | PR (MP/s) | Diff |");
+    println!("|-------------|-----------|------|");
+    println!("| {:.3} | {:.3} | {} |\n", main_mps, head_mps, diff_str);
+
+    println!("---\n");
+    println!("<sup>Generated by jxl-perfhistory</sup>");
+}
+
+fn print_results_multifile_markdown(
+    results: &[Revision],
+    _mi: &mut MedianIndices,
+    _args: &Args,
+    noise_metrics: &NoiseMetrics,
+) {
+    // Get GitHub repo URL for commit links
+    let repo = Repository::open(".").ok();
+    let github_url = repo.as_ref().and_then(get_github_repo_url);
+
+    if results.len() < 2 {
+        println!("Need at least 2 revisions to show comparisons.");
+        return;
+    }
+
+    // HEAD (newest) vs main (oldest)
+    let head_rev = &results[0];
+    let main_rev = &results[results.len() - 1];
+
+    // Format commits as links
+    let head_commit = if let Some(ref url) = github_url {
+        format!("[{:.8}]({}/commit/{})", head_rev.oid, url, head_rev.oid)
+    } else {
+        format!("`{:.8}`", head_rev.oid)
+    };
+    let main_commit = if let Some(ref url) = github_url {
+        format!("[{:.8}]({}/commit/{})", main_rev.oid, url, main_rev.oid)
+    } else {
+        format!("`{:.8}`", main_rev.oid)
+    };
+
+    let repo_url = if let Some(ref url) = github_url {
+        url.clone()
+    } else {
+        "https://github.com/libjxl/jxl-rs".to_string()
+    };
+
+    // Header
+    println!("# 🎯 JPEG XL Multi-File Performance Benchmark\n");
+
+    println!("| | |");
+    println!("|---|---|");
+    println!("| **Comparing** | {} vs {} (main) |", head_commit, main_commit);
+    println!("| **Repository** | {} |", repo_url);
+    println!("| **CPU Architecture** | {} |", std::env::consts::ARCH);
+
+    // System warnings if present
+    if let Some(warning) = noise_metrics.warning_message() {
+        println!("| **Warning** | ⚠️ {} |", warning);
+    }
+
+    println!();
+    println!("---\n");
+
+    // Results table - compare HEAD vs main directly
+    println!("## 📊 Results\n");
+    println!("| File | Main (MP/s) | PR (MP/s) | Diff |");
+    println!("|------|-------------|-----------|------|");
+
+    for (file_idx, head_fr) in head_rev.file_results.iter().enumerate() {
+        let main_fr = &main_rev.file_results[file_idx];
+
+        if let (Some(main_median), Some(head_median)) = (main_fr.median, head_fr.median) {
+            let file_name = Path::new(&head_fr.file_path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            // Convert pixels/s to MP/s (megapixels per second)
+            let main_mps = main_median / 1_000_000.0;
+            let head_mps = head_median / 1_000_000.0;
+
+            // Calculate percentage difference
+            let pct_diff = ((head_median - main_median) / main_median) * 100.0;
+
+            // Format diff with indicator
+            let diff_str = if pct_diff > 5.0 {
+                format!("**{:+.2}%** 🚀", pct_diff)
+            } else if pct_diff < -5.0 {
+                format!("**{:+.2}%** 🐌", pct_diff)
+            } else {
+                format!("{:+.2}%", pct_diff)
+            };
+
+            let file_display = format_file_with_preview(&file_name);
+            println!("| {} | {:.3} | {:.3} | {} |",
+                     file_display, main_mps, head_mps, diff_str);
+        }
+    }
+
+    println!("\n---\n");
     println!("<sup>Generated by jxl-perfhistory</sup>");
 }
 
