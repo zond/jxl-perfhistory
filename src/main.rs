@@ -635,7 +635,9 @@ const TARGET_BENCHMARK_SECS: f64 = 0.5;
 impl Revision {
     /// Run jxl_cli benchmark and return pixels/s
     fn run_benchmark(&self, file_path: &str, num_reps: u32) -> Result<f64> {
-        let output = Command::new(self.binary_path.as_ref().unwrap())
+        let binary_path = self.binary_path.as_ref()
+            .ok_or_else(|| eyre!("Binary not built for {:.8}", self.oid))?;
+        let output = Command::new(binary_path)
             .arg(file_path)
             .args(["--speedtest", "--num-reps", &num_reps.to_string()])
             .output()?;
@@ -738,6 +740,49 @@ impl Revision {
     }
 }
 
+/// Create a single Revision struct for a given commit OID.
+fn create_revision(
+    repo: &Repository,
+    oid: Oid,
+    ordinal: usize,
+    data_dir: Option<&Path>,
+    files: &[String],
+) -> Result<Revision> {
+    let file_results: Result<Vec<FileResult>> = files
+        .iter()
+        .map(|file_path| {
+            let measurement_file = match data_dir {
+                Some(dir) => {
+                    // Use hash-based naming for multi-file, plain oid for single file
+                    let file_name = if files.len() == 1 {
+                        oid.to_string()
+                    } else {
+                        format!("{}-{}", oid, file_path_hash(file_path))
+                    };
+                    MeasurementFile::open(&dir.join(file_name))?
+                }
+                None => MeasurementFile {
+                    file: None,
+                    measurements: Vec::new(),
+                },
+            };
+            Ok(FileResult::new(file_path.clone(), measurement_file))
+        })
+        .collect();
+
+    Ok(Revision {
+        oid,
+        summary: repo
+            .find_commit(oid)?
+            .summary()
+            .unwrap_or("(no message)")
+            .to_string(),
+        binary_path: None,
+        file_results: file_results?,
+        ordinal,
+    })
+}
+
 fn collect_revisions(
     repo: &Repository,
     count: usize,
@@ -753,40 +798,7 @@ fn collect_revisions(
         .map(|oid| {
             let oid = oid?;
             ordinal += 1;
-
-            let file_results: Result<Vec<FileResult>> = files
-                .iter()
-                .map(|file_path| {
-                    let measurement_file = match data_dir {
-                        Some(dir) => {
-                            // Use hash-based naming for multi-file, plain oid for single file
-                            let file_name = if files.len() == 1 {
-                                oid.to_string()
-                            } else {
-                                format!("{}-{}", oid, file_path_hash(file_path))
-                            };
-                            MeasurementFile::open(&dir.join(file_name))?
-                        }
-                        None => MeasurementFile {
-                            file: None,
-                            measurements: Vec::new(),
-                        },
-                    };
-                    Ok(FileResult::new(file_path.clone(), measurement_file))
-                })
-                .collect();
-
-            Ok(Revision {
-                oid,
-                summary: repo
-                    .find_commit(oid)?
-                    .summary()
-                    .unwrap_or("(no message)")
-                    .to_string(),
-                binary_path: None,
-                file_results: file_results?,
-                ordinal,
-            })
+            create_revision(repo, oid, ordinal, data_dir, files)
         })
         .collect()
 }
@@ -808,47 +820,11 @@ fn collect_pr_revisions(
         .map_err(|e| eyre!("Cannot resolve base ref '{}': {}", base_ref, e))?
         .id();
 
-    // Helper to create a revision
-    let make_revision = |oid: Oid, ordinal: usize| -> Result<Revision> {
-        let file_results: Result<Vec<FileResult>> = files
-            .iter()
-            .map(|file_path| {
-                let measurement_file = match data_dir {
-                    Some(dir) => {
-                        let file_name = if files.len() == 1 {
-                            oid.to_string()
-                        } else {
-                            format!("{}-{}", oid, file_path_hash(file_path))
-                        };
-                        MeasurementFile::open(&dir.join(file_name))?
-                    }
-                    None => MeasurementFile {
-                        file: None,
-                        measurements: Vec::new(),
-                    },
-                };
-                Ok(FileResult::new(file_path.clone(), measurement_file))
-            })
-            .collect();
-
-        Ok(Revision {
-            oid,
-            summary: repo
-                .find_commit(oid)?
-                .summary()
-                .unwrap_or("(no message)")
-                .to_string(),
-            binary_path: None,
-            file_results: file_results?,
-            ordinal,
-        })
-    };
-
     // Return HEAD first (ordinal 1), then base (ordinal 2)
     // This matches the existing convention where results[0] is newest
     Ok(vec![
-        make_revision(head_oid, 1)?,
-        make_revision(base_oid, 2)?,
+        create_revision(repo, head_oid, 1, data_dir, files)?,
+        create_revision(repo, base_oid, 2, data_dir, files)?,
     ])
 }
 
@@ -1142,12 +1118,12 @@ fn main() -> Result<()> {
 
     if is_multi_file {
         if args.pr_comment {
-            print_results_multifile_markdown(&revisions, &args, &noise_metrics);
+            print_results_multifile_markdown(&repo, &revisions, &args, &noise_metrics);
         } else {
             print_results_multifile(&revisions, &mut mi, &args, &noise_metrics);
         }
     } else if args.pr_comment {
-        print_results_single_markdown(&revisions, &args, &noise_metrics);
+        print_results_single_markdown(&repo, &revisions, &args, &noise_metrics);
     } else {
         print_results_single(&revisions, &mut mi, &args, &noise_metrics);
     }
@@ -1557,12 +1533,16 @@ fn format_diff(pct_diff: f64) -> String {
 // Markdown Output Functions
 // ============================================================================
 
-fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metrics: &NoiseMetrics) {
+fn print_results_single_markdown(
+    repo: &Repository,
+    results: &[Revision],
+    args: &Args,
+    noise_metrics: &NoiseMetrics,
+) {
     let file_name = args.jxl_file.as_deref().unwrap_or("unknown");
 
     // Get GitHub repo URL for commit links
-    let repo = Repository::open(".").ok();
-    let github_url = repo.as_ref().and_then(get_github_repo_url);
+    let github_url = get_github_repo_url(repo);
 
     if results.len() < 2 {
         println!("Need at least 2 revisions to show comparisons.");
@@ -1634,13 +1614,13 @@ fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metric
 }
 
 fn print_results_multifile_markdown(
+    repo: &Repository,
     results: &[Revision],
     args: &Args,
     noise_metrics: &NoiseMetrics,
 ) {
     // Get GitHub repo URL for commit links
-    let repo = Repository::open(".").ok();
-    let github_url = repo.as_ref().and_then(get_github_repo_url);
+    let github_url = get_github_repo_url(repo);
 
     if results.len() < 2 {
         println!("Need at least 2 revisions to show comparisons.");
