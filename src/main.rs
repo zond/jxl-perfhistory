@@ -1002,7 +1002,7 @@ fn main() -> Result<()> {
         let base_ref = args
             .base_ref
             .clone()
-            .or_else(|| std::env::var("GITHUB_BASE_REF").ok())
+            .or_else(|| std::env::var("GITHUB_BASE_REF").ok().filter(|s| !s.is_empty()))
             .ok_or_else(|| {
                 eyre!(
                     "--pr-comment requires --base-ref or GITHUB_BASE_REF environment variable"
@@ -1535,12 +1535,12 @@ fn get_github_repo_url(repo: &Repository) -> Option<String> {
     // Parse GitHub URL (supports both SSH and HTTPS)
     // SSH: git@github.com:owner/repo.git
     // HTTPS: https://github.com/owner/repo.git
-    if let Some(captures) = url.strip_prefix("git@github.com:") {
-        Some(format!("https://github.com/{}", captures.trim_end_matches(".git")))
-    } else if let Some(captures) = url.strip_prefix("https://github.com/") {
-        Some(format!("https://github.com/{}", captures.trim_end_matches(".git")))
-    } else if let Some(captures) = url.strip_prefix("http://github.com/") {
-        Some(format!("https://github.com/{}", captures.trim_end_matches(".git")))
+    if let Some(path) = url.strip_prefix("git@github.com:") {
+        Some(format!("https://github.com/{}", path.trim_end_matches(".git")))
+    } else if let Some(path) = url.strip_prefix("https://github.com/") {
+        Some(format!("https://github.com/{}", path.trim_end_matches(".git")))
+    } else if let Some(path) = url.strip_prefix("http://github.com/") {
+        Some(format!("https://github.com/{}", path.trim_end_matches(".git")))
     } else {
         None
     }
