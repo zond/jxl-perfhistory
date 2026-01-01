@@ -947,6 +947,13 @@ fn main() -> Result<()> {
     setup_ctrlc_handler();
     let args = Args::parse();
 
+    // Warn if --base-ref is used without --pr-comment
+    if args.base_ref.is_some() && !args.pr_comment {
+        eprintln!(
+            "Warning: --base-ref has no effect without --pr-comment, ignoring"
+        );
+    }
+
     // Parse file list from --file or --glob
     let files: Vec<String> = if let Some(ref pattern) = args.glob_pattern {
         let paths: Vec<_> = glob(pattern)?
@@ -1146,12 +1153,10 @@ fn main() -> Result<()> {
         } else {
             print_results_multifile(&revisions, &mut mi, &args, &noise_metrics);
         }
+    } else if use_markdown {
+        print_results_single_markdown(&revisions, &args, &noise_metrics);
     } else {
-        if use_markdown {
-            print_results_single_markdown(&revisions, &args, &noise_metrics);
-        } else {
-            print_results_single(&revisions, &mut mi, &args, &noise_metrics);
-        }
+        print_results_single(&revisions, &mut mi, &args, &noise_metrics);
     }
 
     Ok(())
@@ -1535,15 +1540,15 @@ fn get_github_repo_url(repo: &Repository) -> Option<String> {
     // Parse GitHub URL (supports both SSH and HTTPS)
     // SSH: git@github.com:owner/repo.git
     // HTTPS: https://github.com/owner/repo.git
-    if let Some(path) = url.strip_prefix("git@github.com:") {
-        Some(format!("https://github.com/{}", path.trim_end_matches(".git")))
-    } else if let Some(path) = url.strip_prefix("https://github.com/") {
-        Some(format!("https://github.com/{}", path.trim_end_matches(".git")))
-    } else if let Some(path) = url.strip_prefix("http://github.com/") {
-        Some(format!("https://github.com/{}", path.trim_end_matches(".git")))
-    } else {
-        None
-    }
+    let path = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
+
+    Some(format!(
+        "https://github.com/{}",
+        path.trim_end_matches(".git")
+    ))
 }
 
 /// Format percentage diff - bold only for significant changes (>10%)
@@ -1599,9 +1604,17 @@ fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metric
     println!("  Max relative error: {:>10.1}%", 100.0 * args.rel_error);
     println!("```");
 
-    // Get base and PR speeds
-    let base_median = base_rev.file_results[0].median.unwrap();
-    let pr_median = pr_rev.file_results[0].median.unwrap();
+    // Get base and PR speeds (guard against missing medians)
+    let (base_median, pr_median) = match (
+        base_rev.file_results[0].median,
+        pr_rev.file_results[0].median,
+    ) {
+        (Some(b), Some(p)) => (b, p),
+        _ => {
+            println!("Insufficient measurement data for comparison.");
+            return;
+        }
+    };
 
     // Convert to MP/s
     let base_mps = base_median / 1_000_000.0;
@@ -1616,10 +1629,11 @@ fn print_results_single_markdown(results: &[Revision], args: &Args, noise_metric
         .map(|e| format!("±{:.1}%", e * 100.0))
         .unwrap_or_default();
 
-    // Results table with commit links in description row
+    // Comparison description and results table
+    println!("**Comparing:** {} (Base) vs {} (PR)", base_link, pr_link);
+    println!();
     println!("| File | Base (MP/s) | PR (MP/s) | Δ% |");
     println!("|:-----|------------:|----------:|---:|");
-    println!("| *{}* | | *{}* | |", base_link, pr_link);
     println!(
         "| {} | {:.3} | {:.3} | {} {} |",
         file_name, base_mps, pr_mps, format_diff(pct_diff), error_str
@@ -1670,10 +1684,11 @@ fn print_results_multifile_markdown(
     println!("  Max relative error: {:>10.1}%", 100.0 * args.rel_error);
     println!("```");
 
-    // Results table with commit links in description row
+    // Comparison description and results table
+    println!("**Comparing:** {} (Base) vs {} (PR)", base_link, pr_link);
+    println!();
     println!("| File | Base (MP/s) | PR (MP/s) | Δ% |");
     println!("|:-----|------------:|----------:|---:|");
-    println!("| *{}* | | *{}* | |", base_link, pr_link);
 
     for (file_idx, pr_fr) in pr_rev.file_results.iter().enumerate() {
         let base_fr = &base_rev.file_results[file_idx];
