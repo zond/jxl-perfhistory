@@ -113,6 +113,16 @@ struct Args {
     /// Comma-separated list of process names to pause during benchmarking (e.g., "chrome,firefox")
     #[arg(long = "pause-processes", value_delimiter = ',')]
     pause_processes: Vec<String>,
+
+    /// PR comparison mode: compare HEAD against --base-ref (or GITHUB_BASE_REF env var).
+    /// Outputs results in GitHub-flavored markdown format suitable for PR comments.
+    #[arg(long = "pr-comment")]
+    pr_comment: bool,
+
+    /// Base git ref to compare against (branch, tag, or commit hash).
+    /// Used with --pr-comment. Defaults to GITHUB_BASE_REF env var if not specified.
+    #[arg(long = "base-ref")]
+    base_ref: Option<String>,
 }
 
 /// System noise metrics collected before benchmarking
@@ -625,7 +635,9 @@ const TARGET_BENCHMARK_SECS: f64 = 0.5;
 impl Revision {
     /// Run jxl_cli benchmark and return pixels/s
     fn run_benchmark(&self, file_path: &str, num_reps: u32) -> Result<f64> {
-        let output = Command::new(self.binary_path.as_ref().unwrap())
+        let binary_path = self.binary_path.as_ref()
+            .ok_or_else(|| eyre!("Binary not built for {:.8}", self.oid))?;
+        let output = Command::new(binary_path)
             .arg(file_path)
             .args(["--speedtest", "--num-reps", &num_reps.to_string()])
             .output()?;
@@ -728,6 +740,49 @@ impl Revision {
     }
 }
 
+/// Create a single Revision struct for a given commit OID.
+fn create_revision(
+    repo: &Repository,
+    oid: Oid,
+    ordinal: usize,
+    data_dir: Option<&Path>,
+    files: &[String],
+) -> Result<Revision> {
+    let file_results: Result<Vec<FileResult>> = files
+        .iter()
+        .map(|file_path| {
+            let measurement_file = match data_dir {
+                Some(dir) => {
+                    // Use hash-based naming for multi-file, plain oid for single file
+                    let file_name = if files.len() == 1 {
+                        oid.to_string()
+                    } else {
+                        format!("{}-{}", oid, file_path_hash(file_path))
+                    };
+                    MeasurementFile::open(&dir.join(file_name))?
+                }
+                None => MeasurementFile {
+                    file: None,
+                    measurements: Vec::new(),
+                },
+            };
+            Ok(FileResult::new(file_path.clone(), measurement_file))
+        })
+        .collect();
+
+    Ok(Revision {
+        oid,
+        summary: repo
+            .find_commit(oid)?
+            .summary()
+            .unwrap_or("(no message)")
+            .to_string(),
+        binary_path: None,
+        file_results: file_results?,
+        ordinal,
+    })
+}
+
 fn collect_revisions(
     repo: &Repository,
     count: usize,
@@ -743,42 +798,34 @@ fn collect_revisions(
         .map(|oid| {
             let oid = oid?;
             ordinal += 1;
-
-            let file_results: Result<Vec<FileResult>> = files
-                .iter()
-                .map(|file_path| {
-                    let measurement_file = match data_dir {
-                        Some(dir) => {
-                            // Use hash-based naming for multi-file, plain oid for single file
-                            let file_name = if files.len() == 1 {
-                                oid.to_string()
-                            } else {
-                                format!("{}-{}", oid, file_path_hash(file_path))
-                            };
-                            MeasurementFile::open(&dir.join(file_name))?
-                        }
-                        None => MeasurementFile {
-                            file: None,
-                            measurements: Vec::new(),
-                        },
-                    };
-                    Ok(FileResult::new(file_path.clone(), measurement_file))
-                })
-                .collect();
-
-            Ok(Revision {
-                oid,
-                summary: repo
-                    .find_commit(oid)?
-                    .summary()
-                    .unwrap_or("(no message)")
-                    .to_string(),
-                binary_path: None,
-                file_results: file_results?,
-                ordinal,
-            })
+            create_revision(repo, oid, ordinal, data_dir, files)
         })
         .collect()
+}
+
+/// Collect exactly two revisions for PR comparison: HEAD and a base ref.
+/// Returns (head_revision, base_revision) with ordinals 1 and 2.
+fn collect_pr_revisions(
+    repo: &Repository,
+    base_ref: &str,
+    data_dir: Option<&Path>,
+    files: &[String],
+) -> Result<Vec<Revision>> {
+    // Resolve HEAD
+    let head_oid = repo.head()?.target().ok_or_else(|| eyre!("HEAD has no target"))?;
+
+    // Resolve base ref (can be branch name, tag, or commit hash)
+    let base_oid = repo
+        .revparse_single(base_ref)
+        .map_err(|e| eyre!("Cannot resolve base ref '{}': {}", base_ref, e))?
+        .id();
+
+    // Return HEAD first (ordinal 1), then base (ordinal 2)
+    // This matches the existing convention where results[0] is newest
+    Ok(vec![
+        create_revision(repo, head_oid, 1, data_dir, files)?,
+        create_revision(repo, base_oid, 2, data_dir, files)?,
+    ])
 }
 
 fn checkout_revision(repo: &Repository, oid: Oid) -> Result<()> {
@@ -872,6 +919,13 @@ fn main() -> Result<()> {
     setup_ctrlc_handler();
     let args = Args::parse();
 
+    // Warn if --base-ref is used without --pr-comment
+    if args.base_ref.is_some() && !args.pr_comment {
+        eprintln!(
+            "Warning: --base-ref has no effect without --pr-comment, ignoring"
+        );
+    }
+
     // Parse file list from --file or --glob
     let files: Vec<String> = if let Some(ref pattern) = args.glob_pattern {
         let paths: Vec<_> = glob(pattern)?
@@ -921,12 +975,33 @@ fn main() -> Result<()> {
         ));
     }
 
-    let mut revisions = collect_revisions(
-        &repo,
-        args.revisions,
-        args.data_directory.as_deref().map(Path::new),
-        &files,
-    )?;
+    // Collect revisions to benchmark
+    let mut revisions = if args.pr_comment {
+        // PR comment mode: compare HEAD vs base ref
+        let base_ref = args
+            .base_ref
+            .clone()
+            .or_else(|| std::env::var("GITHUB_BASE_REF").ok().filter(|s| !s.is_empty()))
+            .ok_or_else(|| {
+                eyre!(
+                    "--pr-comment requires --base-ref or GITHUB_BASE_REF environment variable"
+                )
+            })?;
+        eprintln!("PR comment mode: comparing HEAD vs {}", base_ref);
+        collect_pr_revisions(
+            &repo,
+            &base_ref,
+            args.data_directory.as_deref().map(Path::new),
+            &files,
+        )?
+    } else {
+        collect_revisions(
+            &repo,
+            args.revisions,
+            args.data_directory.as_deref().map(Path::new),
+            &files,
+        )?
+    };
 
     // Compute medians for any file results that have enough measurements
     for rev in &mut revisions {
@@ -1042,7 +1117,13 @@ fn main() -> Result<()> {
     revisions.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
 
     if is_multi_file {
-        print_results_multifile(&revisions, &mut mi, &args, &noise_metrics);
+        if args.pr_comment {
+            print_results_multifile_markdown(&repo, &revisions, &args, &noise_metrics);
+        } else {
+            print_results_multifile(&revisions, &mut mi, &args, &noise_metrics);
+        }
+    } else if args.pr_comment {
+        print_results_single_markdown(&repo, &revisions, &args, &noise_metrics);
     } else {
         print_results_single(&revisions, &mut mi, &args, &noise_metrics);
     }
@@ -1414,3 +1495,202 @@ fn print_results_multifile(
 
     println!("\n{}", "=".repeat(160));
 }
+
+// ============================================================================
+// Markdown Output Helper Functions
+// ============================================================================
+
+/// Extract GitHub repository URL from git remote
+fn get_github_repo_url(repo: &Repository) -> Option<String> {
+    // Try to get the remote URL
+    let remote = repo.find_remote("origin").ok()?;
+    let url = remote.url()?;
+
+    // Parse GitHub URL (supports both SSH and HTTPS)
+    // SSH: git@github.com:owner/repo.git
+    // HTTPS: https://github.com/owner/repo.git
+    let path = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
+
+    Some(format!(
+        "https://github.com/{}",
+        path.trim_end_matches(".git")
+    ))
+}
+
+/// Format percentage diff - bold only for significant changes (>10%)
+fn format_diff(pct_diff: f64) -> String {
+    if pct_diff.abs() > 10.0 {
+        format!("**{:+.2}%**", pct_diff)
+    } else {
+        format!("{:+.2}%", pct_diff)
+    }
+}
+
+// ============================================================================
+// Markdown Output Functions
+// ============================================================================
+
+fn print_results_single_markdown(
+    repo: &Repository,
+    results: &[Revision],
+    args: &Args,
+    noise_metrics: &NoiseMetrics,
+) {
+    let file_name = args.jxl_file.as_deref().unwrap_or("unknown");
+
+    // Get GitHub repo URL for commit links
+    let github_url = get_github_repo_url(repo);
+
+    if results.len() < 2 {
+        println!("Need at least 2 revisions to show comparisons.");
+        return;
+    }
+
+    // PR (newest) vs Base (oldest)
+    let pr_rev = &results[0];
+    let base_rev = &results[results.len() - 1];
+
+    // Format commit links (short hash with markdown link)
+    let pr_link = if let Some(ref url) = github_url {
+        format!("[{:.8}]({}/commit/{})", pr_rev.oid, url, pr_rev.oid)
+    } else {
+        format!("{:.8}", pr_rev.oid)
+    };
+    let base_link = if let Some(ref url) = github_url {
+        format!("[{:.8}]({}/commit/{})", base_rev.oid, url, base_rev.oid)
+    } else {
+        format!("{:.8}", base_rev.oid)
+    };
+
+    // Header
+    println!("```");
+    println!("BENCHMARK RESULTS (1 file)");
+    println!("  CPU architecture: {}", std::env::consts::ARCH);
+    if let Some(warning) = noise_metrics.warning_message() {
+        println!("  {}", warning);
+    }
+    println!("Statistics:");
+    println!("  Confidence:         {:>10.1}%", 100.0 * args.confidence);
+    println!("  Max relative error: {:>10.1}%", 100.0 * args.rel_error);
+    println!("```");
+
+    // Get base and PR speeds (guard against missing medians)
+    let (base_median, pr_median) = match (
+        base_rev.file_results[0].median,
+        pr_rev.file_results[0].median,
+    ) {
+        (Some(b), Some(p)) => (b, p),
+        _ => {
+            println!("Insufficient measurement data for comparison.");
+            return;
+        }
+    };
+
+    // Convert to MP/s
+    let base_mps = base_median / 1_000_000.0;
+    let pr_mps = pr_median / 1_000_000.0;
+
+    // Calculate percentage difference
+    let pct_diff = ((pr_median - base_median) / base_median) * 100.0;
+
+    // Get relative error for the PR measurement
+    let error_str = pr_rev.file_results[0]
+        .rel_error
+        .map(|e| format!("±{:.1}%", e * 100.0))
+        .unwrap_or_default();
+
+    // Comparison description and results table
+    println!("**Comparing:** {} (Base) vs {} (PR)", base_link, pr_link);
+    println!();
+    println!("| File | Base (MP/s) | PR (MP/s) | Δ% |");
+    println!("|:-----|------------:|----------:|---:|");
+    println!(
+        "| {} | {:.3} | {:.3} | {} {} |",
+        file_name, base_mps, pr_mps, format_diff(pct_diff), error_str
+    );
+}
+
+fn print_results_multifile_markdown(
+    repo: &Repository,
+    results: &[Revision],
+    args: &Args,
+    noise_metrics: &NoiseMetrics,
+) {
+    // Get GitHub repo URL for commit links
+    let github_url = get_github_repo_url(repo);
+
+    if results.len() < 2 {
+        println!("Need at least 2 revisions to show comparisons.");
+        return;
+    }
+
+    // PR (newest) vs Base (oldest)
+    let pr_rev = &results[0];
+    let base_rev = &results[results.len() - 1];
+
+    // Format commit links (short hash with markdown link)
+    let pr_link = if let Some(ref url) = github_url {
+        format!("[{:.8}]({}/commit/{})", pr_rev.oid, url, pr_rev.oid)
+    } else {
+        format!("{:.8}", pr_rev.oid)
+    };
+    let base_link = if let Some(ref url) = github_url {
+        format!("[{:.8}]({}/commit/{})", base_rev.oid, url, base_rev.oid)
+    } else {
+        format!("{:.8}", base_rev.oid)
+    };
+
+    let num_files = pr_rev.file_results.len();
+
+    // Header in code block
+    println!("```");
+    println!("MULTI-FILE BENCHMARK RESULTS ({} files)", num_files);
+    println!("  CPU architecture: {}", std::env::consts::ARCH);
+    if let Some(warning) = noise_metrics.warning_message() {
+        println!("  {}", warning);
+    }
+    println!("Statistics:");
+    println!("  Confidence:         {:>10.1}%", 100.0 * args.confidence);
+    println!("  Max relative error: {:>10.1}%", 100.0 * args.rel_error);
+    println!("```");
+
+    // Comparison description and results table
+    println!("**Comparing:** {} (Base) vs {} (PR)", base_link, pr_link);
+    println!();
+    println!("| File | Base (MP/s) | PR (MP/s) | Δ% |");
+    println!("|:-----|------------:|----------:|---:|");
+
+    for (file_idx, pr_fr) in pr_rev.file_results.iter().enumerate() {
+        let base_fr = &base_rev.file_results[file_idx];
+
+        if let (Some(base_median), Some(pr_median)) = (base_fr.median, pr_fr.median) {
+            let file_name = Path::new(&pr_fr.file_path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            // Convert pixels/s to MP/s (megapixels per second)
+            let base_mps = base_median / 1_000_000.0;
+            let pr_mps = pr_median / 1_000_000.0;
+
+            // Calculate percentage difference
+            let pct_diff = ((pr_median - base_median) / base_median) * 100.0;
+
+            // Get relative error for the PR measurement
+            let error_str = pr_fr
+                .rel_error
+                .map(|e| format!("±{:.1}%", e * 100.0))
+                .unwrap_or_default();
+
+            println!(
+                "| {} | {:.3} | {:.3} | {} {} |",
+                file_name, base_mps, pr_mps, format_diff(pct_diff), error_str
+            );
+        }
+    }
+}
+
