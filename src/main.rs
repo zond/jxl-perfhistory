@@ -114,8 +114,12 @@ struct Args {
     #[arg(long = "pause-processes", value_delimiter = ',')]
     pause_processes: Vec<String>,
 
-    /// Output results as GitHub-flavored markdown for PR comments.
-    /// Compares HEAD against --base-ref (or GITHUB_BASE_REF env var).
+    /// Output results in GitHub-flavored markdown format
+    #[arg(long = "markdown")]
+    markdown: bool,
+
+    /// PR comparison mode: compare HEAD against --base-ref (or GITHUB_BASE_REF env var).
+    /// Implies --markdown output format.
     #[arg(long = "pr-comment")]
     pr_comment: bool,
 
@@ -1133,14 +1137,17 @@ fn main() -> Result<()> {
     // Sort by ordinal for display
     revisions.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
 
+    // --pr-comment implies --markdown
+    let use_markdown = args.markdown || args.pr_comment;
+
     if is_multi_file {
-        if args.pr_comment {
+        if use_markdown {
             print_results_multifile_markdown(&revisions, &args, &noise_metrics);
         } else {
             print_results_multifile(&revisions, &mut mi, &args, &noise_metrics);
         }
     } else {
-        if args.pr_comment {
+        if use_markdown {
             print_results_single_markdown(&revisions, &args, &noise_metrics);
         } else {
             print_results_single(&revisions, &mut mi, &args, &noise_metrics);
