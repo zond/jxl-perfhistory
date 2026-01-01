@@ -815,9 +815,11 @@ fn collect_pr_revisions(
     let head_oid = repo.head()?.target().ok_or_else(|| eyre!("HEAD has no target"))?;
 
     // Resolve base ref (can be branch name, tag, or commit hash)
+    // Try multiple strategies for shallow clones (like in GitHub Actions)
     let base_oid = repo
         .revparse_single(base_ref)
-        .map_err(|e| eyre!("Cannot resolve base ref '{}': {}", base_ref, e))?
+        .or_else(|_| repo.revparse_single(&format!("origin/{}", base_ref)))
+        .map_err(|e| eyre!("Cannot resolve base ref '{}': {}. In CI, ensure the base branch is fetched (e.g., `git fetch origin {}`)", base_ref, e, base_ref))?
         .id();
 
     // Return HEAD first (ordinal 1), then base (ordinal 2)
