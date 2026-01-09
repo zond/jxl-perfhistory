@@ -649,13 +649,33 @@ impl Revision {
             ));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout
-            .lines()
-            .find(|line| line.contains("pixels/s") && line.contains("Decoded"))
-            .and_then(|line| line.split_whitespace().rev().nth(1))
-            .ok_or_else(|| eyre!("Can't find decoding speed in `{}`", stdout))?
-            .parse()
-            .map_err(|e| eyre!("Can't parse decoding speed: {}", e))
+
+        // Try new format first: "Decoded ... X MP/s"
+        // Then fall back to old format: "Decoded ... X pixels/s"
+        if let Some(line) = stdout.lines().find(|line| line.contains("MP/s") && line.contains("Decoded")) {
+            let value: f64 = line
+                .split_whitespace()
+                .rev()
+                .nth(1)
+                .ok_or_else(|| eyre!("Can't find MP/s value in `{}`", line))?
+                .parse()
+                .map_err(|e| eyre!("Can't parse MP/s value: {}", e))?;
+            // Convert MP/s to pixels/s
+            return Ok(value * 1_000_000.0);
+        }
+
+        if let Some(line) = stdout.lines().find(|line| line.contains("pixels/s") && line.contains("Decoded")) {
+            let value: f64 = line
+                .split_whitespace()
+                .rev()
+                .nth(1)
+                .ok_or_else(|| eyre!("Can't find pixels/s value in `{}`", line))?
+                .parse()
+                .map_err(|e| eyre!("Can't parse pixels/s value: {}", e))?;
+            return Ok(value);
+        }
+
+        Err(eyre!("Can't find decoding speed (MP/s or pixels/s) in `{}`", stdout))
     }
 
     /// Benchmark a specific file and append the result to its measurements.
