@@ -45,10 +45,18 @@ jxl-perfhistory -f /path/to/image.jxl
 | `-c, --confidence <F>` | Required confidence interval (0.0-1.0) | 0.95 |
 | `-e, --error <F>` | Maximum relative error threshold | 0.05 |
 | `-m, --min-measurements <N>` | Minimum measurements per revision | 10 |
+| `-w, --warmup-reps <N>` | Number of warmup repetitions (if supported by revision) | 1 |
 | `-b, --binary-directory <PATH>` | Persistent directory for built binaries | temp |
 | `-d, --data-directory <PATH>` | Directory for persistent measurements (resumable) | - |
 | `--pause-processes <LIST>` | Comma-separated process names to pause during benchmarks | - |
 | `--ignore-noisy-system` | Continue even if system appears too noisy | false |
+
+### Warmup Repetitions
+
+Recent versions of `jxl_cli` support a `--warmup-reps` flag for warmup decodes before measuring. This tool automatically detects whether each revision supports this flag:
+
+- **Revisions with `--warmup-reps` support**: Uses `--warmup-reps=0` during calibration (to accurately time a single decode), then uses the user-specified warmup count for actual measurements.
+- **Revisions without `--warmup-reps` support**: Enforces a minimum of 10 repetitions per measurement to compensate for the implicit warmup in the first decode.
 
 ### Reducing Measurement Noise
 

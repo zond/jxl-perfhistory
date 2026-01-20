@@ -124,6 +124,10 @@ struct Args {
     /// Used with --pr-comment. Defaults to GITHUB_BASE_REF env var if not specified.
     #[arg(long = "base-ref")]
     base_ref: Option<String>,
+
+    /// Number of warmup repetitions for jxl_cli (if supported by the revision)
+    #[arg(short = 'w', long = "warmup-reps", default_value = "1")]
+    warmup_reps: u32,
 }
 
 /// System noise metrics collected before benchmarking
@@ -248,25 +252,6 @@ fn validate_process_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Unpause processes by sending SIGCONT
-fn unpause_processes(processes: &[String]) {
-    if processes.is_empty() {
-        return;
-    }
-    eprintln!("Resuming processes: {}", processes.join(", "));
-    for name in processes {
-        let output = Command::new("killall").args(["-SIGCONT", name]).output();
-        if let Ok(output) = output
-            && !output.status.success()
-        {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("no process found") {
-                eprintln!("Warning: failed to resume {}: {}", name, stderr.trim());
-            }
-        }
-    }
-}
-
 /// RAII guard to ensure processes are resumed even on panic/error
 struct ProcessPauser {
     processes: Vec<String>,
@@ -280,24 +265,13 @@ impl ProcessPauser {
             validate_process_name(name)?;
         }
 
-        if !processes.is_empty() {
-            eprintln!("Pausing processes: {}", processes.join(", "));
-            for name in &processes {
-                let output = Command::new("killall").args(["-SIGSTOP", name]).output()?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !stderr.contains("no process found") {
-                        eprintln!("Warning: failed to pause {}: {}", name, stderr.trim());
-                    }
-                }
-            }
-        }
+        Self::pause_impl(&processes)?;
 
-        // Register cleanup closure
+        // Register cleanup closure using static method pattern
         let cleanup_id = if !processes.is_empty() {
             let procs = processes.clone();
             Some(register_cleanup(Box::new(move || {
-                unpause_processes(&procs);
+                Self::cleanup_impl(&procs);
             })))
         } else {
             None
@@ -309,25 +283,170 @@ impl ProcessPauser {
         })
     }
 
-    fn resume(&mut self) -> Result<()> {
-        unpause_processes(&self.processes);
-        self.processes.clear();
-        // Unregister from cleanup registry
+    /// Pause processes by sending SIGSTOP
+    fn pause_impl(processes: &[String]) -> Result<()> {
+        if processes.is_empty() {
+            return Ok(());
+        }
+        eprintln!("Pausing processes: {}", processes.join(", "));
+        for name in processes {
+            let output = Command::new("killall").args(["-SIGSTOP", name]).output()?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("no process found") {
+                    eprintln!("Warning: failed to pause {}: {}", name, stderr.trim());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resume processes by sending SIGCONT
+    fn cleanup_impl(processes: &[String]) {
+        if processes.is_empty() {
+            return;
+        }
+        eprintln!("Resuming processes: {}", processes.join(", "));
+        for name in processes {
+            let output = Command::new("killall").args(["-SIGCONT", name]).output();
+            if let Ok(output) = output
+                && !output.status.success()
+            {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("no process found") {
+                    eprintln!("Warning: failed to resume {}: {}", name, stderr.trim());
+                }
+            }
+        }
+    }
+
+    /// Explicit cleanup - call this on success or error for proper cleanup
+    fn cleanup(&mut self) {
         if let Some(id) = self.cleanup_id.take() {
             unregister_cleanup(id);
         }
-        Ok(())
+        Self::cleanup_impl(&self.processes);
+        self.processes.clear();
     }
 }
 
 impl Drop for ProcessPauser {
     fn drop(&mut self) {
-        if !self.processes.is_empty() {
-            eprintln!("Warning: ProcessPauser dropped without explicit resume, resuming now...");
-            unpause_processes(&self.processes);
+        if self.cleanup_id.is_some() || !self.processes.is_empty() {
+            eprintln!(
+                "Warning: ProcessPauser dropped without explicit cleanup, cleaning up now..."
+            );
+            self.cleanup();
         }
+    }
+}
+
+/// RAII guard for git worktrees - ensures cleanup on error, Ctrl-C, or normal exit
+struct WorktreeGuard {
+    repo_path: PathBuf,
+    worktree_base: PathBuf,
+    worktree_names: Vec<String>,
+    cleanup_id: Option<usize>,
+}
+
+impl WorktreeGuard {
+    fn new(repo: &Repository, worktree_base: PathBuf) -> Self {
+        let repo_path = repo.path().to_path_buf();
+
+        // Clean up any dangling worktrees from previous runs
+        Self::cleanup_dangling(repo);
+
+        let worktree_base_clone = worktree_base.clone();
+        let repo_path_clone = repo_path.clone();
+
+        // Register cleanup for Ctrl-C (uses pattern matching since we can't share the vec)
+        let cleanup_id = register_cleanup(Box::new(move || {
+            Self::cleanup_impl(&repo_path_clone, &worktree_base_clone, &[]);
+        }));
+
+        Self {
+            repo_path,
+            worktree_base,
+            worktree_names: Vec::new(),
+            cleanup_id: Some(cleanup_id),
+        }
+    }
+
+    fn add_worktree(&mut self, name: String) {
+        self.worktree_names.push(name);
+    }
+
+    /// Clean up any dangling worktrees and branches from previous runs
+    fn cleanup_dangling(repo: &Repository) {
+        // Prune worktrees that match our pattern
+        if let Ok(worktrees) = repo.worktrees() {
+            for name in worktrees.iter().flatten() {
+                if name.starts_with("jxl-perf-")
+                    && let Ok(worktree) = repo.find_worktree(name)
+                {
+                    let mut prune_opts = git2::WorktreePruneOptions::new();
+                    prune_opts.working_tree(true);
+                    let _ = worktree.prune(Some(&mut prune_opts));
+                }
+            }
+        }
+
+        // Delete branches that match our pattern
+        if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
+            for branch in branches.flatten() {
+                if let Some(name) = branch.0.name().ok().flatten()
+                    && name.starts_with("jxl-perf-")
+                {
+                    let _ = branch.0.into_reference().delete();
+                }
+            }
+        }
+    }
+
+    /// Internal cleanup implementation - used by both explicit cleanup and Ctrl-C handler
+    fn cleanup_impl(repo_path: &Path, worktree_base: &Path, worktree_names: &[String]) {
+        eprint!("Cleaning up worktrees...");
+
+        if let Ok(repo) = Repository::open(repo_path.parent().unwrap_or(repo_path)) {
+            // If we have specific names, clean those up properly
+            if !worktree_names.is_empty() {
+                for name in worktree_names {
+                    if let Ok(worktree) = repo.find_worktree(name) {
+                        let mut prune_opts = git2::WorktreePruneOptions::new();
+                        prune_opts.working_tree(true);
+                        let _ = worktree.prune(Some(&mut prune_opts));
+                    }
+                    if let Ok(mut branch) = repo.find_branch(name, git2::BranchType::Local) {
+                        let _ = branch.delete();
+                    }
+                }
+            } else {
+                // Fallback: clean up by pattern (for Ctrl-C when we don't have the names)
+                Self::cleanup_dangling(&repo);
+            }
+        }
+
+        let _ = fs::remove_dir_all(worktree_base);
+        eprintln!("done");
+    }
+
+    /// Explicit cleanup - call this on success or error for proper cleanup
+    fn cleanup(&mut self) {
         if let Some(id) = self.cleanup_id.take() {
             unregister_cleanup(id);
+        }
+        Self::cleanup_impl(&self.repo_path, &self.worktree_base, &self.worktree_names);
+        self.worktree_names.clear();
+    }
+}
+
+impl Drop for WorktreeGuard {
+    fn drop(&mut self) {
+        if self.cleanup_id.is_some() || !self.worktree_names.is_empty() {
+            eprintln!(
+                "Warning: WorktreeGuard dropped without explicit cleanup, cleaning up now..."
+            );
+            self.cleanup();
         }
     }
 }
@@ -571,21 +690,34 @@ struct Revision {
     binary_path: Option<String>,
     file_results: Vec<FileResult>,
     ordinal: usize,
+    /// Whether this revision's jxl_cli supports --warmup-reps flag
+    has_warmup_reps: bool,
 }
 
 const TARGET_BENCHMARK_SECS: f64 = 0.5;
 
 impl Revision {
     /// Run jxl_cli benchmark and return pixels/s
-    fn run_benchmark(&self, file_path: &str, num_reps: u32) -> Result<f64> {
+    /// If warmup_reps is Some and has_warmup_reps is true, adds --warmup-reps flag
+    fn run_benchmark(
+        &self,
+        file_path: &str,
+        num_reps: u32,
+        warmup_reps: Option<u32>,
+    ) -> Result<f64> {
         let binary_path = self
             .binary_path
             .as_ref()
             .ok_or_else(|| eyre!("Binary not built for {:.8}", self.oid))?;
-        let output = Command::new(binary_path)
-            .arg(file_path)
-            .args(["--speedtest", "--num-reps", &num_reps.to_string()])
-            .output()?;
+        let mut cmd = Command::new(binary_path);
+        cmd.arg(file_path)
+            .args(["--speedtest", "--num-reps", &num_reps.to_string()]);
+        if self.has_warmup_reps
+            && let Some(warmup) = warmup_reps
+        {
+            cmd.args(["--warmup-reps", &warmup.to_string()]);
+        }
+        let output = cmd.output()?;
         if !output.status.success() {
             return Err(eyre!(
                 "Benchmark failed for {:.8}!\n{}",
@@ -634,7 +766,9 @@ impl Revision {
 
     /// Benchmark a specific file and append the result to its measurements.
     /// On first run, calibrates num_reps to achieve TARGET_BENCHMARK_SECS.
-    pub fn benchmark(&mut self, file_idx: usize) -> Result<()> {
+    /// warmup_reps is the user-configured warmup count (used for actual measurements).
+    /// For calibration, warmup_reps=0 is used to get accurate timing.
+    pub fn benchmark(&mut self, file_idx: usize, warmup_reps: u32) -> Result<()> {
         use std::time::Instant;
 
         let file_path = self.file_results[file_idx].file_path.clone();
@@ -642,29 +776,35 @@ impl Revision {
 
         // Calibrate num_reps on first measurement, or use existing value
         if let Some(reps) = num_reps {
-            let pixels_per_sec = self.run_benchmark(&file_path, reps)?;
+            // Regular measurement with user-specified warmup
+            let pixels_per_sec = self.run_benchmark(&file_path, reps, Some(warmup_reps))?;
             self.file_results[file_idx]
                 .measurement_file
                 .append(pixels_per_sec)?;
         } else {
+            // Calibration run with warmup_reps=0 for accurate timing
             let start = Instant::now();
-            let pixels_per_sec = self.run_benchmark(&file_path, 1)?;
+            self.run_benchmark(&file_path, 1, Some(0))?;
             let elapsed = start.elapsed().as_secs_f64();
 
-            if elapsed < TARGET_BENCHMARK_SECS {
-                let needed_reps = (TARGET_BENCHMARK_SECS / elapsed).ceil() as u32;
-                self.file_results[file_idx].num_reps = Some(needed_reps);
-                // Redo measurement with correct num_reps
-                let pixels_per_sec = self.run_benchmark(&file_path, needed_reps)?;
-                self.file_results[file_idx]
-                    .measurement_file
-                    .append(pixels_per_sec)?;
+            let mut needed_reps = if elapsed < TARGET_BENCHMARK_SECS {
+                (TARGET_BENCHMARK_SECS / elapsed).ceil() as u32
             } else {
-                self.file_results[file_idx].num_reps = Some(1);
-                self.file_results[file_idx]
-                    .measurement_file
-                    .append(pixels_per_sec)?;
+                1
+            };
+
+            // Revisions without warmup_reps support need at least 10 reps
+            // to compensate for the implicit warmup in the first rep
+            if !self.has_warmup_reps && needed_reps < 10 {
+                needed_reps = 10;
             }
+
+            self.file_results[file_idx].num_reps = Some(needed_reps);
+            // Redo measurement with correct num_reps and user warmup
+            let pixels_per_sec = self.run_benchmark(&file_path, needed_reps, Some(warmup_reps))?;
+            self.file_results[file_idx]
+                .measurement_file
+                .append(pixels_per_sec)?;
         }
 
         Ok(())
@@ -676,6 +816,18 @@ impl Revision {
         } else {
             self.summary.clone()
         }
+    }
+
+    /// Detect if this revision's jxl_cli supports --warmup-reps flag
+    fn detect_warmup_reps_support(&mut self) -> Result<()> {
+        let binary_path = self
+            .binary_path
+            .as_ref()
+            .ok_or_else(|| eyre!("Binary not built for {:.8}", self.oid))?;
+        let output = Command::new(binary_path).arg("-h").output()?;
+        let help_text = String::from_utf8_lossy(&output.stdout);
+        self.has_warmup_reps = help_text.contains("--warmup-reps");
+        Ok(())
     }
 }
 
@@ -719,6 +871,7 @@ fn create_revision(
         binary_path: None,
         file_results: file_results?,
         ordinal,
+        has_warmup_reps: false, // Will be detected after building
     })
 }
 
@@ -850,47 +1003,32 @@ fn build_revisions_parallel(
     // Create worktree directory
     fs::create_dir_all(worktree_base)?;
 
-    // Register cleanup for worktrees (in case of Ctrl-C)
-    let worktree_base_clone = worktree_base.to_path_buf();
-    let cleanup_id = register_cleanup(Box::new(move || {
-        eprintln!("Cleaning up worktrees...");
-        let _ = fs::remove_dir_all(&worktree_base_clone);
-    }));
+    // RAII guard ensures worktrees are cleaned up on error, Ctrl-C, or success
+    let mut worktree_guard = WorktreeGuard::new(repo, worktree_base.to_path_buf());
 
     // Create worktrees using git2 (must be done sequentially)
     for task in &to_build {
         eprint!("Creating worktree for {:.8}...", task.oid);
 
-        // Create the worktree
         repo.worktree(&task.worktree_name, &task.worktree_path, None)
-            .map_err(|e| {
-                unregister_cleanup(cleanup_id);
-                let _ = fs::remove_dir_all(worktree_base);
-                eyre!("Failed to create worktree for {:.8}: {}", task.oid, e)
-            })?;
+            .map_err(|e| eyre!("Failed to create worktree for {:.8}: {}", task.oid, e))?;
+
+        // Track this worktree for cleanup
+        worktree_guard.add_worktree(task.worktree_name.clone());
 
         // Open the worktree as a repo and checkout the specific commit
-        let wt_repo = Repository::open(&task.worktree_path).map_err(|e| {
-            unregister_cleanup(cleanup_id);
-            let _ = fs::remove_dir_all(worktree_base);
-            eyre!("Failed to open worktree for {:.8}: {}", task.oid, e)
-        })?;
+        let wt_repo = Repository::open(&task.worktree_path)
+            .map_err(|e| eyre!("Failed to open worktree for {:.8}: {}", task.oid, e))?;
 
-        wt_repo.set_head_detached(task.oid).map_err(|e| {
-            unregister_cleanup(cleanup_id);
-            let _ = fs::remove_dir_all(worktree_base);
-            eyre!("Failed to set HEAD for {:.8}: {}", task.oid, e)
-        })?;
+        wt_repo
+            .set_head_detached(task.oid)
+            .map_err(|e| eyre!("Failed to set HEAD for {:.8}: {}", task.oid, e))?;
 
         let mut checkout_opts = git2::build::CheckoutBuilder::new();
         checkout_opts.force();
         wt_repo
             .checkout_head(Some(&mut checkout_opts))
-            .map_err(|e| {
-                unregister_cleanup(cleanup_id);
-                let _ = fs::remove_dir_all(worktree_base);
-                eyre!("Failed to checkout {:.8}: {}", task.oid, e)
-            })?;
+            .map_err(|e| eyre!("Failed to checkout {:.8}: {}", task.oid, e))?;
 
         eprintln!("done");
     }
@@ -936,18 +1074,8 @@ fn build_revisions_parallel(
         })
         .collect();
 
-    // Clean up worktrees using git2
-    eprint!("Cleaning up worktrees...");
-    for task in &to_build {
-        if let Ok(worktree) = repo.find_worktree(&task.worktree_name) {
-            let mut prune_opts = git2::WorktreePruneOptions::new();
-            prune_opts.working_tree(true);
-            let _ = worktree.prune(Some(&mut prune_opts));
-        }
-    }
-    let _ = fs::remove_dir_all(worktree_base);
-    unregister_cleanup(cleanup_id);
-    eprintln!("done");
+    // Explicit cleanup (guard would also clean up on drop, but this is cleaner)
+    worktree_guard.cleanup();
 
     // Process results and update revisions
     let mut build_count = 0;
@@ -1129,6 +1257,11 @@ fn main() -> Result<()> {
     let worktree_dir = tmp_dir.path().join("worktrees");
     build_revisions_parallel(&repo, &mut revisions, binary_dir, &worktree_dir)?;
 
+    // Detect --warmup-reps support for each revision
+    for rev in &mut revisions {
+        rev.detect_warmup_reps_support()?;
+    }
+
     // RAII guard ensures processes are resumed even on error/panic
     let mut process_pauser = ProcessPauser::new(args.pause_processes.clone())?;
 
@@ -1162,7 +1295,7 @@ fn main() -> Result<()> {
             );
         }
 
-        rev.benchmark(file_idx)?;
+        rev.benchmark(file_idx, args.warmup_reps)?;
         let fr = &mut rev.file_results[file_idx];
         let old_relative_error = fr.rel_error;
 
@@ -1187,8 +1320,8 @@ fn main() -> Result<()> {
         }
     }
 
-    // Resume paused processes (explicit for error handling, guard is safety net)
-    process_pauser.resume()?;
+    // Cleanup paused processes (explicit for error handling, guard is safety net)
+    process_pauser.cleanup();
 
     // Sort by ordinal for display
     revisions.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
