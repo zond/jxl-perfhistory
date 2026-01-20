@@ -118,6 +118,42 @@ Shows relative performance changes between revisions:
 - Speedup/slowdown ratios with confidence intervals
 - Statistically significant changes highlighted (when the CI doesn't include 1.0)
 
+## Development
+
+```bash
+cargo build --release       # Release build
+cargo fmt                   # Format code
+cargo clippy                # Lint check
+```
+
+Always run `cargo fmt` and `cargo clippy` before committing.
+
+### Code Quality
+
+The project enforces strict unsafe code linting via Cargo.toml:
+- `missing_safety_doc = "deny"` - All unsafe blocks must be documented
+- `undocumented_unsafe_blocks = "deny"`
+- `unsafe_op_in_unsafe_fn = "deny"`
+
+### Architecture
+
+The codebase is a single `src/main.rs` file organized around these key components:
+
+- **`Args` struct** - CLI argument parsing with clap derive macros
+- **`NoiseMetrics`** - System noise calibration using `/proc/loadavg`
+- **`ProcessPauser`** - RAII guard for SIGSTOP/SIGCONT process control
+- **Global cleanup registry** - Handles Ctrl-C interruption safely via `ctrlc`
+
+Key code patterns:
+- Git operations use `git2` crate for checkout and revision walking
+- Benchmarking uses order statistics with binomial distribution for credible intervals
+- Output supports both ASCII graphs and GitHub-flavored markdown (`--pr-comment` flag)
+
+### Platform Support
+
+- Primary platform is Linux (uses `/proc/loadavg`, SIGSTOP/SIGCONT signals)
+- Windows MSVC has special rustflags in `.cargo/config.toml`
+
 ## License
 
 BSD-3-Clause
