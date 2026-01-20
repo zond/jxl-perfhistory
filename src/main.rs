@@ -9,11 +9,12 @@ use git2::{Oid, Repository};
 use glob::glob;
 use memmap2::Mmap;
 use rand::Rng;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::result;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -331,64 +332,6 @@ impl Drop for ProcessPauser {
     }
 }
 
-/// RAII guard to ensure git repo is restored to original branch even on panic/error.
-///
-/// Note: There's a small race window where if Ctrl-C fires during restore(), both the
-/// explicit restore and the cleanup handler might run. This is harmless since restoring
-/// to the same commit is idempotent.
-struct RepoGuard {
-    original_ref_name: Option<String>,
-    cleanup_id: Option<usize>,
-}
-
-impl RepoGuard {
-    fn new(original_ref_name: String) -> Self {
-        // Register cleanup closure for Ctrl-C handler
-        let ref_name = original_ref_name.clone();
-        let cleanup_id = Some(register_cleanup(Box::new(move || {
-            eprintln!("Restoring repo to: {}", ref_name);
-            if let Ok(repo) = Repository::open(".") {
-                let _ = restore_repo(&repo, ref_name.clone());
-            }
-        })));
-        Self {
-            original_ref_name: Some(original_ref_name),
-            cleanup_id,
-        }
-    }
-
-    /// Explicitly restore the repo to the original branch.
-    /// Unregisters from cleanup registry to prevent double-restore on Ctrl-C.
-    fn restore(&mut self) -> Result<()> {
-        // Unregister from cleanup registry FIRST to minimize race window
-        if let Some(id) = self.cleanup_id.take() {
-            unregister_cleanup(id);
-        }
-        if let Some(ref original_ref_name) = self.original_ref_name {
-            let repo = Repository::open(".")?;
-            restore_repo(&repo, original_ref_name.clone())?;
-            self.original_ref_name = None;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for RepoGuard {
-    fn drop(&mut self) {
-        // Safety net: try to restore if not already done
-        if let Some(ref original_ref_name) = self.original_ref_name {
-            eprintln!("Warning: RepoGuard dropped without explicit restore, restoring now...");
-            if let Ok(repo) = Repository::open(".") {
-                let _ = restore_repo(&repo, original_ref_name.clone());
-            }
-        }
-        // Unregister from cleanup registry
-        if let Some(id) = self.cleanup_id.take() {
-            unregister_cleanup(id);
-        }
-    }
-}
-
 /// Handle for a measurement file that stays open for appending.
 /// Contains both the file handle and the in-memory measurements.
 struct MeasurementFile {
@@ -635,7 +578,9 @@ const TARGET_BENCHMARK_SECS: f64 = 0.5;
 impl Revision {
     /// Run jxl_cli benchmark and return pixels/s
     fn run_benchmark(&self, file_path: &str, num_reps: u32) -> Result<f64> {
-        let binary_path = self.binary_path.as_ref()
+        let binary_path = self
+            .binary_path
+            .as_ref()
             .ok_or_else(|| eyre!("Binary not built for {:.8}", self.oid))?;
         let output = Command::new(binary_path)
             .arg(file_path)
@@ -652,7 +597,10 @@ impl Revision {
 
         // Try new format first: "Decoded ... X MP/s"
         // Then fall back to old format: "Decoded ... X pixels/s"
-        if let Some(line) = stdout.lines().find(|line| line.contains("MP/s") && line.contains("Decoded")) {
+        if let Some(line) = stdout
+            .lines()
+            .find(|line| line.contains("MP/s") && line.contains("Decoded"))
+        {
             let value: f64 = line
                 .split_whitespace()
                 .rev()
@@ -664,7 +612,10 @@ impl Revision {
             return Ok(value * 1_000_000.0);
         }
 
-        if let Some(line) = stdout.lines().find(|line| line.contains("pixels/s") && line.contains("Decoded")) {
+        if let Some(line) = stdout
+            .lines()
+            .find(|line| line.contains("pixels/s") && line.contains("Decoded"))
+        {
             let value: f64 = line
                 .split_whitespace()
                 .rev()
@@ -675,7 +626,10 @@ impl Revision {
             return Ok(value);
         }
 
-        Err(eyre!("Can't find decoding speed (MP/s or pixels/s) in `{}`", stdout))
+        Err(eyre!(
+            "Can't find decoding speed (MP/s or pixels/s) in `{}`",
+            stdout
+        ))
     }
 
     /// Benchmark a specific file and append the result to its measurements.
@@ -686,8 +640,13 @@ impl Revision {
         let file_path = self.file_results[file_idx].file_path.clone();
         let num_reps = self.file_results[file_idx].num_reps;
 
-        // Calibrate num_reps on first measurement
-        if num_reps.is_none() {
+        // Calibrate num_reps on first measurement, or use existing value
+        if let Some(reps) = num_reps {
+            let pixels_per_sec = self.run_benchmark(&file_path, reps)?;
+            self.file_results[file_idx]
+                .measurement_file
+                .append(pixels_per_sec)?;
+        } else {
             let start = Instant::now();
             let pixels_per_sec = self.run_benchmark(&file_path, 1)?;
             let elapsed = start.elapsed().as_secs_f64();
@@ -706,51 +665,11 @@ impl Revision {
                     .measurement_file
                     .append(pixels_per_sec)?;
             }
-        } else {
-            let pixels_per_sec = self.run_benchmark(&file_path, num_reps.unwrap())?;
-            self.file_results[file_idx]
-                .measurement_file
-                .append(pixels_per_sec)?;
         }
 
         Ok(())
     }
 
-    pub fn build(&mut self, binary_dir: &Path) -> Result<()> {
-        let binary_path = binary_dir.join(self.oid.to_string());
-        self.binary_path = Some(binary_path.to_string_lossy().to_string());
-
-        if binary_path.exists() {
-            return Ok(());
-        }
-
-        let build = Command::new("cargo")
-            .args([
-                "build",
-                "--release",
-                "--package",
-                "jxl_cli",
-                "--bin",
-                "jxl_cli",
-            ])
-            .output()?;
-
-        if !build.status.success() {
-            return Err(eyre!(
-                "Build failed for {:.8}!\n{}",
-                self.oid,
-                String::from_utf8_lossy(&build.stderr)
-            ));
-        }
-
-        let binary_name = format!("jxl_cli{}", std::env::consts::EXE_SUFFIX);   
-        let source_path = Path::new("target")
-            .join("release")
-            .join(&binary_name);
-        fs::copy(&source_path, &binary_path)?;
-
-        Ok(())
-    }
     fn clipped_summary(&self, len: usize) -> String {
         if self.summary.len() > len {
             format!("{}...", &self.summary[..(len - 3)])
@@ -832,7 +751,10 @@ fn collect_pr_revisions(
     files: &[String],
 ) -> Result<Vec<Revision>> {
     // Resolve HEAD
-    let head_oid = repo.head()?.target().ok_or_else(|| eyre!("HEAD has no target"))?;
+    let head_oid = repo
+        .head()?
+        .target()
+        .ok_or_else(|| eyre!("HEAD has no target"))?;
 
     // Resolve base ref (can be branch name, tag, or commit hash)
     // Try multiple strategies for shallow clones (like in GitHub Actions)
@@ -850,19 +772,7 @@ fn collect_pr_revisions(
     ])
 }
 
-fn checkout_revision(repo: &Repository, oid: Oid) -> Result<()> {
-    let commit = repo.find_commit(oid)?;
-
-    let mut opts = git2::build::CheckoutBuilder::new();
-    opts.safe(); // Don't overwrite modified files or remove untracked files
-
-    repo.checkout_tree(commit.as_object(), Some(&mut opts))?;
-    repo.set_head_detached(oid)?;
-
-    Ok(())
-}
-
-fn verify_repo(repo: &Repository) -> Result<String> {
+fn verify_repo(repo: &Repository) -> Result<()> {
     let mut status_opts = git2::StatusOptions::new();
     status_opts.include_untracked(false);
     let statuses = repo.statuses(Some(&mut status_opts))?;
@@ -871,38 +781,195 @@ fn verify_repo(repo: &Repository) -> Result<String> {
             "Working directory has uncommitted changes. Please commit or stash them first."
         ));
     }
-
-    // Save original HEAD state (branch or detached commit)
-    let head = repo.head()?;
-    if head.is_branch() {
-        head.name()
-            .ok_or(eyre!(
-                "Working directory doesn't have a name, won't be able to restore it properly."
-            ))
-            .map(|s| s.into())
-    } else {
-        // Detached HEAD - save the commit hash
-        let oid = head.target().ok_or(eyre!(
-            "Detached HEAD doesn't point to a commit, won't be able to restore it properly."
-        ))?;
-        Ok(oid.to_string())
-    }
+    Ok(())
 }
 
-fn restore_repo(repo: &Repository, original_ref: String) -> Result<()> {
-    // Try parsing as OID first (handles SHA-1, SHA-256, and short hashes)
-    // If that fails, treat it as a branch ref
-    if let Ok(oid) = Oid::from_str(&original_ref) {
-        // Detached HEAD - restore to specific commit
-        repo.set_head_detached(oid)?;
-    } else {
-        // Branch ref
-        repo.set_head(&original_ref)?;
+/// Information needed to build a revision (extracted to allow parallel processing)
+struct BuildTask {
+    index: usize,
+    oid: Oid,
+    summary: String,
+    worktree_name: String,
+    worktree_path: PathBuf,
+}
+
+/// Build binaries for multiple revisions in parallel using git worktrees.
+/// Returns the number of revisions that were built (excludes cached builds).
+fn build_revisions_parallel(
+    repo: &Repository,
+    revisions: &mut [Revision],
+    binary_dir: &Path,
+    worktree_base: &Path,
+) -> Result<usize> {
+    // Collect revisions that need building (not already cached)
+    let to_build: Vec<BuildTask> = revisions
+        .iter()
+        .enumerate()
+        .filter(|(_, rev)| !binary_dir.join(rev.oid.to_string()).exists())
+        .map(|(i, rev)| {
+            let worktree_name = format!("jxl-perf-{}", rev.oid);
+            BuildTask {
+                index: i,
+                oid: rev.oid,
+                summary: rev.summary.clone(),
+                worktree_name: worktree_name.clone(),
+                worktree_path: worktree_base.join(&worktree_name),
+            }
+        })
+        .collect();
+
+    if to_build.is_empty() {
+        // All binaries already cached, just set paths
+        for rev in revisions.iter_mut() {
+            let binary_path = binary_dir.join(rev.oid.to_string());
+            rev.binary_path = Some(binary_path.to_string_lossy().to_string());
+        }
+        return Ok(0);
     }
-    let mut opts = git2::build::CheckoutBuilder::new();
-    opts.force();
-    repo.checkout_head(Some(&mut opts))?;
-    Ok(())
+
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let num_workers = num_cpus.min(to_build.len());
+
+    eprintln!(
+        "Building {} revision(s) in parallel using {} worker(s)...",
+        to_build.len(),
+        num_workers
+    );
+
+    // Pre-fetch dependencies in main repo to avoid parallel downloads
+    eprint!("Fetching dependencies...");
+    let fetch = Command::new("cargo").args(["fetch"]).output()?;
+    if !fetch.status.success() {
+        eprintln!("warning: cargo fetch failed, builds may download dependencies");
+    } else {
+        eprintln!("done");
+    }
+
+    // Create worktree directory
+    fs::create_dir_all(worktree_base)?;
+
+    // Register cleanup for worktrees (in case of Ctrl-C)
+    let worktree_base_clone = worktree_base.to_path_buf();
+    let cleanup_id = register_cleanup(Box::new(move || {
+        eprintln!("Cleaning up worktrees...");
+        let _ = fs::remove_dir_all(&worktree_base_clone);
+    }));
+
+    // Create worktrees using git2 (must be done sequentially)
+    for task in &to_build {
+        eprint!("Creating worktree for {:.8}...", task.oid);
+
+        // Create the worktree
+        repo.worktree(&task.worktree_name, &task.worktree_path, None)
+            .map_err(|e| {
+                unregister_cleanup(cleanup_id);
+                let _ = fs::remove_dir_all(worktree_base);
+                eyre!("Failed to create worktree for {:.8}: {}", task.oid, e)
+            })?;
+
+        // Open the worktree as a repo and checkout the specific commit
+        let wt_repo = Repository::open(&task.worktree_path).map_err(|e| {
+            unregister_cleanup(cleanup_id);
+            let _ = fs::remove_dir_all(worktree_base);
+            eyre!("Failed to open worktree for {:.8}: {}", task.oid, e)
+        })?;
+
+        wt_repo.set_head_detached(task.oid).map_err(|e| {
+            unregister_cleanup(cleanup_id);
+            let _ = fs::remove_dir_all(worktree_base);
+            eyre!("Failed to set HEAD for {:.8}: {}", task.oid, e)
+        })?;
+
+        let mut checkout_opts = git2::build::CheckoutBuilder::new();
+        checkout_opts.force();
+        wt_repo
+            .checkout_head(Some(&mut checkout_opts))
+            .map_err(|e| {
+                unregister_cleanup(cleanup_id);
+                let _ = fs::remove_dir_all(worktree_base);
+                eyre!("Failed to checkout {:.8}: {}", task.oid, e)
+            })?;
+
+        eprintln!("done");
+    }
+
+    // Build in parallel using rayon
+    let build_results: Vec<Result<(usize, String)>> = to_build
+        .par_iter()
+        .map(|task| {
+            eprintln!("Building {:.8}: {}...", task.oid, task.summary);
+
+            let binary_path = binary_dir.join(task.oid.to_string());
+
+            let build = Command::new("cargo")
+                .args([
+                    "build",
+                    "--release",
+                    "--package",
+                    "jxl_cli",
+                    "--bin",
+                    "jxl_cli",
+                ])
+                .current_dir(&task.worktree_path)
+                .output()?;
+
+            if !build.status.success() {
+                return Err(eyre!(
+                    "Build failed for {:.8}!\n{}",
+                    task.oid,
+                    String::from_utf8_lossy(&build.stderr)
+                ));
+            }
+
+            let binary_name = format!("jxl_cli{}", std::env::consts::EXE_SUFFIX);
+            let source_path = task
+                .worktree_path
+                .join("target")
+                .join("release")
+                .join(&binary_name);
+            fs::copy(&source_path, &binary_path)?;
+
+            eprintln!("Built {:.8} successfully", task.oid);
+            Ok((task.index, binary_path.to_string_lossy().to_string()))
+        })
+        .collect();
+
+    // Clean up worktrees using git2
+    eprint!("Cleaning up worktrees...");
+    for task in &to_build {
+        if let Ok(worktree) = repo.find_worktree(&task.worktree_name) {
+            let mut prune_opts = git2::WorktreePruneOptions::new();
+            prune_opts.working_tree(true);
+            let _ = worktree.prune(Some(&mut prune_opts));
+        }
+    }
+    let _ = fs::remove_dir_all(worktree_base);
+    unregister_cleanup(cleanup_id);
+    eprintln!("done");
+
+    // Process results and update revisions
+    let mut build_count = 0;
+    for result in build_results {
+        match result {
+            Ok((idx, binary_path)) => {
+                revisions[idx].binary_path = Some(binary_path);
+                build_count += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Set paths for cached builds
+    for rev in revisions.iter_mut() {
+        if rev.binary_path.is_none() {
+            let binary_path = binary_dir.join(rev.oid.to_string());
+            rev.binary_path = Some(binary_path.to_string_lossy().to_string());
+        }
+    }
+
+    Ok(build_count)
 }
 
 /// Check if a file result is finished (has enough measurements with acceptable error)
@@ -943,9 +1010,7 @@ fn main() -> Result<()> {
 
     // Warn if --base-ref is used without --pr-comment
     if args.base_ref.is_some() && !args.pr_comment {
-        eprintln!(
-            "Warning: --base-ref has no effect without --pr-comment, ignoring"
-        );
+        eprintln!("Warning: --base-ref has no effect without --pr-comment, ignoring");
     }
 
     // Parse file list from --file or --glob
@@ -974,7 +1039,7 @@ fn main() -> Result<()> {
     };
 
     let repo = Repository::open(".")?;
-    let original_ref_name = verify_repo(&repo)?;
+    verify_repo(&repo)?;
     let mut mi = MedianIndices::new(args.confidence)?;
 
     // Check system noise before starting
@@ -1003,11 +1068,13 @@ fn main() -> Result<()> {
         let base_ref = args
             .base_ref
             .clone()
-            .or_else(|| std::env::var("GITHUB_BASE_REF").ok().filter(|s| !s.is_empty()))
+            .or_else(|| {
+                std::env::var("GITHUB_BASE_REF")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
             .ok_or_else(|| {
-                eyre!(
-                    "--pr-comment requires --base-ref or GITHUB_BASE_REF environment variable"
-                )
+                eyre!("--pr-comment requires --base-ref or GITHUB_BASE_REF environment variable")
             })?;
         eprintln!("PR comment mode: comparing HEAD vs {}", base_ref);
         collect_pr_revisions(
@@ -1057,22 +1124,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // RAII guard ensures repo is restored even on error/panic
-    let mut repo_guard = RepoGuard::new(original_ref_name.clone());
-
-    // Build binaries for revisions that need benchmarking
-    for rev in revisions
-        .iter_mut()
-        .filter(|rev| !is_revision_finished(rev, args.min_measurements, args.rel_error))
-    {
-        checkout_revision(&repo, rev.oid)?;
-        eprint!("Building {}: {}...", rev.oid, rev.summary);
-        rev.build(binary_dir)?;
-        eprintln!("done!");
-    }
-
-    // Restore repo (explicit for error handling, guard is safety net)
-    repo_guard.restore()?;
+    // Build binaries in parallel using git worktrees
+    // Only builds revisions that don't have cached binaries
+    let worktree_dir = tmp_dir.path().join("worktrees");
+    build_revisions_parallel(&repo, &mut revisions, binary_dir, &worktree_dir)?;
 
     // RAII guard ensures processes are resumed even on error/panic
     let mut process_pauser = ProcessPauser::new(args.pause_processes.clone())?;
@@ -1631,7 +1686,11 @@ fn print_results_single_markdown(
     println!("|:-----|------------:|----------:|---:|");
     println!(
         "| {} | {:.3} | {:.3} | {} {} |",
-        file_name, base_mps, pr_mps, format_diff(pct_diff), error_str
+        file_name,
+        base_mps,
+        pr_mps,
+        format_diff(pct_diff),
+        error_str
     );
 }
 
@@ -1710,9 +1769,12 @@ fn print_results_multifile_markdown(
 
             println!(
                 "| {} | {:.3} | {:.3} | {} {} |",
-                file_name, base_mps, pr_mps, format_diff(pct_diff), error_str
+                file_name,
+                base_mps,
+                pr_mps,
+                format_diff(pct_diff),
+                error_str
             );
         }
     }
 }
-
